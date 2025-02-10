@@ -16,11 +16,11 @@
 
 ## 4. Registered Softwares（登记软著）
 
-路侧相机增强的车载端到端纯视觉建图软件（登记号：XXXXXXX；证书号：XXXXXXX）
+- 路侧相机增强的车载端到端纯视觉建图软件（登记号：XXXXXXX；证书号：XXXXXXX）
 
-矢量地图的众源融合端到端生成软件（登记号：XXXXXXX；证书号：XXXXXXX）
+- 矢量地图的众源融合端到端生成软件（登记号：XXXXXXX；证书号：XXXXXXX）
 
-路侧多相机联合生成矢量地图的边缘计算软件（登记号：XXXXXXX；证书号：XXXXXXX）
+- 路侧多相机联合生成矢量地图的边缘计算软件（登记号：XXXXXXX；证书号：XXXXXXX）
 
 单目相机实时生成矢量地图的车载软件（登记号：XXXXXXX；证书号：XXXXXXX）
 
