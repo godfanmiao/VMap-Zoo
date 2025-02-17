@@ -1,4 +1,4 @@
-# NF-VMAP(v1): 矢量地图的众源融合端到端生成技术
+# NF-VMAP(v1): 基于国产 GPU 的众源矢量地图端到端融合生成技术
 
 ## Introduction
 
