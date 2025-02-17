@@ -1,6 +1,8 @@
-好的！如果要将解码模块也使用Transformer架构，我们需要进一步扩展模型，使其在特征融合后通过一个Transformer解码器进行预测。以下是完整的代码实现，其中编码和解码部分都使用Transformer架构。
-修改后的代码
-Python复制
+'''好的！如果类别ID是离散变量，我们需要对模型的输出进行调整，以确保类别ID的预测是分类任务，而不是回归任务。具体来说，我们需要将类别ID的预测部分改为分类输出，并使用交叉熵损失来计算类别ID的损失。
+以下是优化后的代码，其中类别ID的预测部分使用了分类输出，并调整了损失函数以适应离散变量的处理。
+优化后的代码
+'''
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,7 +12,7 @@ from scipy.optimize import linear_sum_assignment
 
 # 定义模型
 class MapTRModel(nn.Module):
-    def __init__(self, embed_dim=128, num_heads=8, num_encoder_layers=6, num_decoder_layers=6):
+    def __init__(self, embed_dim=128, num_heads=8, num_encoder_layers=6, num_decoder_layers=6, num_classes=10):
         super(MapTRModel, self).__init__()
         # 卫星图像处理模块（CNN）
         self.satellite_cnn = models.resnet18(pretrained=True)
@@ -29,7 +31,8 @@ class MapTRModel(nn.Module):
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
 
         # 输出模块
-        self.output_fc = nn.Linear(embed_dim, 3)  # 输出类别ID和二维坐标
+        self.classifier = nn.Linear(embed_dim, num_classes)  # 分类输出类别ID
+        self.regressor = nn.Linear(embed_dim, 2)  # 回归输出二维坐标
 
     def forward(self, satellite_image, vector_points):
         # 卫星图像特征提取
@@ -51,7 +54,10 @@ class MapTRModel(nn.Module):
         decoded_features = self.decoder(tgt, fused_features)
 
         # 输出预测
-        predictions = self.output_fc(decoded_features.permute(1, 0, 2))  # [batch_size, seq_len, 3]
+        decoded_features = decoded_features.permute(1, 0, 2)  # [batch_size, seq_len, embed_dim]
+        class_predictions = self.classifier(decoded_features)  # 分类预测类别ID
+        point_predictions = self.regressor(decoded_features)  # 回归预测二维坐标
+        predictions = torch.cat((class_predictions.unsqueeze(-1), point_predictions), dim=-1)  # [batch_size, seq_len, 3]
         return predictions
 
 
@@ -74,11 +80,10 @@ def hungarian_matching(cost_matrix):
 
 # MapTR风格的损失函数
 class MapTRLoss(nn.Module):
-    def __init__(self, lambda_cls=1.0, lambda_pts=5.0, lambda_dir=1.0):
+    def __init__(self, lambda_cls=1.0, lambda_pts=5.0):
         super(MapTRLoss, self).__init__()
         self.lambda_cls = lambda_cls
         self.lambda_pts = lambda_pts
-        self.lambda_dir = lambda_dir
         self.classification_loss = nn.CrossEntropyLoss()
         self.point_loss = nn.MSELoss()
 
@@ -91,32 +96,28 @@ class MapTRLoss(nn.Module):
         batch_size, num_preds, _ = predictions.shape
         _, num_gts, _ = targets.shape
 
+        # 提取类别ID和坐标
+        pred_classes = predictions[:, :, 0].view(-1, predictions.size(-1))  # [batch_size * num_preds, num_classes]
+        pred_points = predictions[:, :, 1:]  # [batch_size, num_preds, 2]
+        target_classes = targets[:, :, 0].view(-1).long()  # [batch_size * num_gts]
+        target_points = targets[:, :, 1:]  # [batch_size, num_gts, 2]
+
         # 分类损失
-        cls_pred = predictions[:, :, 0]
-        cls_gt = targets[:, :, 0].long()
-        cls_loss = self.classification_loss(cls_pred, cls_gt)
+        cls_loss = self.classification_loss(pred_classes, target_classes)
 
         # 匈牙利匹配
-        cost_matrix = torch.zeros(batch_size, num_preds, num_gts, device=predictions.device)
-        for i in range(batch_size):
-            for j in range(num_preds):
-                for k in range(num_gts):
-                    cost_matrix[i, j, k] = torch.norm(predictions[i, j, 1:] - targets[i, k, 1:], p=2)
+        cost_matrix = torch.cdist(pred_points, target_points, p=2)  # [batch_size, num_preds, num_gts]
         matches = hungarian_matching(cost_matrix)
 
         # 点对点损失
         pts_loss = 0
         for i in range(batch_size):
-            matched_gts = targets[i, matches[i]]
-            pts_loss += self.point_loss(predictions[i, :, 1:], matched_gts[:, 1:])
+            matched_gts = target_points[i, matches[i]]
+            pts_loss += self.point_loss(pred_points[i], matched_gts)
         pts_loss /= batch_size
 
-        # 方向损失（可选）
-        # 这里简化为点对点损失，实际中可以根据需求添加方向损失的计算
-        dir_loss = pts_loss
-
         # 总损失
-        total_loss = self.lambda_cls * cls_loss + self.lambda_pts * pts_loss + self.lambda_dir * dir_loss
+        total_loss = self.lambda_cls * cls_loss + self.lambda_pts * pts_loss
         return total_loss
 
 
@@ -154,29 +155,28 @@ satellite_images = torch.randn(10, 3, 224, 224)  # 示例卫星图像数据
 vector_points = torch.randn(10, 5, 3)  # 示例矢量点图数据，5个点，每个点3个特征（类别ID, x, y）
 labels = torch.randn(10, 5, 3)  # 示例标签数据
 
+# 将类别ID转换为离散变量
+vector_points[:, :, 0] = torch.randint(0, 10, (10, 5)).float()  # 随机生成类别ID
+labels[:, :, 0] = torch.randint(0, 10, (10, 5)).float()  # 随机生成类别ID
+
 dataset = MapTRDataset(satellite_images, vector_points, labels)
 dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
 
 # 初始化模型、优化器和损失函数
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = MapTRModel().to(device)
+model = MapTRModel(num_classes=10).to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 criterion = MapTRLoss()
 
 # 训练模型
 train(model, dataloader, optimizer, criterion, device)
 
-修改点说明
-解码模块：
-使用nn.TransformerDecoder作为解码模块，输入为初始化的零张量（tgt）和融合后的特征序列（fused_features）。
-解码器通过自注意力和编码器-解码器注意力机制生成预测结果。
-特征融合：
-将卫星图像特征和矢量点图特征拼接后输入到Transformer编码器中进行融合。
-融合后的特征作为解码器的输入。
-输出模块：
-解码器的输出通过一个全连接层（output_fc）生成最终的预测结果。
-注意事项
-Transformer解码器的输入需要初始化，这里使用零张量作为初始输入。
-Transformer的性能对超参数（如embed_dim、num_heads、num_encoder_layers、num_decoder_layers）较为敏感，需要根据具体任务进行调整。
-示例数据是随机生成的，实际使用时需要替换为真实数据，并进行适当的预处理。
-希望这段代码能够满足你的需求！
+'''
+优化点说明
+类别ID的处理：
+类别ID是离散变量，因此在模型输出部分，类别ID的预测使用了nn.Linear(embed_dim, num_classes)，并使用nn.CrossEntropyLoss计算分类损失。
+坐标部分仍然是回归任务，使用nn.MSELoss计算损失。
+损失函数：
+分类损失和点对点损失分别计算，并通过权重组合为总损失。
+匈牙利匹配用于计算预测点
+'''
