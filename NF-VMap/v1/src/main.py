@@ -42,10 +42,11 @@ class VectorMapDataset(Dataset):
 
 # Transformer模型
 class MapTransformer(nn.Module):
-    def __init__(self, hidden_dim=256, num_heads=8, num_encoder_layers=6, num_decoder_layers=6, num_queries=100, num_classes=10):
+    def __init__(self, hidden_dim=256, num_heads=8, num_encoder_layers=6, num_decoder_layers=6, num_queries=100, num_classes=10, max_points=50):
         super(MapTransformer, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_queries = num_queries
+        self.max_points = max_points
 
         # 嵌入层
         self.input_proj = nn.Linear(2, hidden_dim)
@@ -60,20 +61,15 @@ class MapTransformer(nn.Module):
 
         # 查询嵌入
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
+
         # 输出层
         self.class_head = nn.Linear(hidden_dim, num_classes + 1)
-        self.bbox_head = nn.Linear(hidden_dim, 2)
+        self.polyline_head = nn.Linear(hidden_dim, max_points * 2)  # 每个点有 (x, y) 两个坐标
 
     def forward(self, coords, classes):
-        """
-        :param coords: 输入的点坐标 [N, 2]
-        :param classes: 输入的点类别 [N]
-        :return: 预测的类别和坐标
-        """
         # 嵌入
         coord_embed = self.input_proj(coords)  # [N, hidden_dim]
         class_embed = self.class_embed(classes)  # [N, hidden_dim]
-
         # 条件调整
         conditional_embed = self.conditional_layer(class_embed)  # [N, hidden_dim]
         combined_embed = coord_embed + conditional_embed  # 条件调整后的嵌入
@@ -85,32 +81,64 @@ class MapTransformer(nn.Module):
 
         # 输出预测
         outputs_class = self.class_head(hs)
-        outputs_coords = self.bbox_head(hs).sigmoid()
-        return outputs_class, outputs_coords
+        outputs_polylines = self.polyline_head(hs).view(-1, self.max_points, 2)  # [num_queries, max_points, 2]
+        return outputs_class, outputs_polylines
 
 # 匈牙利匹配器
 class HungarianMatcher(nn.Module):
-    def __init__(self, cost_class=1, cost_bbox=1, cost_giou=1):
+    def __init__(self, cost_class=1, cost_polyline=1):
         super(HungarianMatcher, self).__init__()
         self.cost_class = cost_class
-        self.cost_bbox = cost_bbox
-        self.cost_giou = cost_giou
+        self.cost_polyline = cost_polyline
+
+    def polyline_distance(self, polyline1, polyline2):
+        """
+        Compute the average point-to-point distance between two polylines.
+        :param polyline1: Tensor of shape [num_points1, 2] representing the first polyline.
+        :param polyline2: Tensor of shape [num_points2, 2] representing the second polyline.
+        :return: Average distance between the two polylines.
+        """
+        # 确保 polyline1 和 polyline2 的形状至少为 [1, 2]
+        if polyline1.dim() == 1:
+            polyline1 = polyline1.unsqueeze(0)  # 将形状从 [2] 转换为 [1, 2]
+        if polyline2.dim() == 1:
+            polyline2 = polyline2.unsqueeze(0)  # 将形状从 [2] 转换为 [1, 2]
+
+        # 计算点到点的距离矩阵
+        dist_matrix = torch.cdist(polyline1, polyline2, p=2)  # Shape: [num_points1, num_points2]
+
+        # 计算 polyline1 到 polyline2 的最小距离
+        min_dist1 = dist_matrix.min(dim=1).values.mean()
+        # 计算 polyline2 到 polyline1 的最小距离
+        min_dist2 = dist_matrix.min(dim=0).values.mean()
+
+        # 返回两条 polyline 之间的平均距离
+        return (min_dist1 + min_dist2) / 2
 
     def forward(self, outputs, targets):
         with torch.no_grad():
             bs, num_queries = outputs["pred_logits"].shape[:2]
-            out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)
-            out_bbox = outputs["pred_boxes"].flatten(0, 1)
+            out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # [batch_size * num_queries, num_classes + 1]
+            out_polylines = outputs["pred_polylines"]  # [batch_size * num_queries, max_points, 2]
 
-            tgt_ids = torch.cat([t["labels"] for t in targets])
-            tgt_bbox = torch.cat([t["boxes"] for t in targets])
+            tgt_ids = torch.cat([t["labels"] for t in targets])  # [num_targets]
+            tgt_polylines = torch.cat([t["polylines"] for t in targets], dim=0)  # [num_targets, max_points, 2]
 
-            cost = -out_prob[:, tgt_ids]
-            cost += self.cost_bbox * torch.cdist(out_bbox, tgt_bbox, p=1)
-            cost += self.cost_giou * -generalized_box_iou(box_cxcywh_to_xyxy(out_bbox), box_cxcywh_to_xyxy(tgt_bbox))
+            # 分类成本
+            cost_class = -out_prob[:, tgt_ids]  # [batch_size * num_queries, num_targets]
 
-            C = cost.view(bs, num_queries, -1).cpu()
-            sizes = [len(t["boxes"]) for t in targets]
+            # polyline 距离成本
+            cost_polyline = torch.zeros_like(cost_class)
+            for i, pred_poly in enumerate(out_polylines):
+                for j, tgt_poly in enumerate(tgt_polylines):
+                    cost_polyline[i, j] = self.polyline_distance(pred_poly, tgt_poly)
+
+            # 综合成本
+            C = self.cost_class * cost_class + self.cost_polyline * cost_polyline
+            C = C.view(bs, num_queries, -1).cpu()
+
+            # 匈牙利匹配
+            sizes = [len(t["labels"]) for t in targets]
             indices = [linear_sum_assignment(c[i]) for i, c in enumerate(C.split(sizes, -1))]
             return [(torch.as_tensor(i, dtype=torch.int64), torch.as_tensor(j, dtype=torch.int64)) for i, j in indices]
 
@@ -122,9 +150,6 @@ class SetCriterion(nn.Module):
         self.matcher = matcher
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
-        empty_weight = torch.ones(self.num_classes + 1)
-        empty_weight[-1] = self.eos_coef
-        self.register_buffer('empty_weight', empty_weight)
 
     def loss_labels(self, outputs, targets, indices, num_boxes):
         src_logits = outputs['pred_logits']
@@ -133,21 +158,17 @@ class SetCriterion(nn.Module):
         target_classes = torch.full(src_logits.shape[:2], self.num_classes,
                                     dtype=torch.int64, device=src_logits.device)
         target_classes[idx] = target_classes_o
-        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes, self.empty_weight)
+        loss_ce = F.cross_entropy(src_logits.transpose(1, 2), target_classes)
         losses = {'loss_ce': loss_ce}
         return losses
 
-    def loss_boxes(self, outputs, targets, indices, num_boxes):
+    def loss_polylines(self, outputs, targets, indices, num_boxes):
         idx = self._get_src_permutation_idx(indices)
-        src_boxes = outputs['pred_boxes'][idx]
-        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-        loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
+        src_polylines = outputs['pred_polylines'][idx]
+        target_polylines = torch.cat([t['polylines'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        loss_polyline = F.l1_loss(src_polylines, target_polylines, reduction='none')
         losses = {}
-        losses['loss_bbox'] = loss_bbox.sum() / num_boxes
-        loss_giou = 1 - torch.diag(generalized_box_iou(
-            box_cxcywh_to_xyxy(src_boxes),
-            box_cxcywh_to_xyxy(target_boxes)))
-        losses['loss_giou'] = loss_giou.sum() / num_boxes
+        losses['loss_polyline'] = loss_polyline.sum() / num_boxes
         return losses
 
     def _get_src_permutation_idx(self, indices):
@@ -163,7 +184,7 @@ class SetCriterion(nn.Module):
         num_boxes = torch.clamp(num_boxes, min=1).item()
         losses = {}
         losses.update(self.loss_labels(outputs, targets, indices, num_boxes))
-        losses.update(self.loss_boxes(outputs, targets, indices, num_boxes))
+        losses.update(self.loss_polylines(outputs, targets, indices, num_boxes))
         return losses
 
 # 辅助函数
@@ -209,8 +230,8 @@ if __name__ == "__main__":
     dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
 
     model = MapTransformer().to(device)
-    matcher = HungarianMatcher(cost_class=1, cost_bbox=1, cost_giou=1)
-    criterion = SetCriterion(num_classes=2, matcher=matcher, weight_dict={'loss_ce': 1, 'loss_bbox': 1, 'loss_giou': 1})
+    matcher = HungarianMatcher(cost_class=1, cost_polyline=1)
+    criterion = SetCriterion(num_classes=2, matcher=matcher, weight_dict={'loss_ce': 1, 'loss_polyline': 1})
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
     for epoch in range(10):
@@ -220,12 +241,12 @@ if __name__ == "__main__":
             classes = batch['classes'].to(device)
             num_points = batch['num_points']
 
-            outputs_class, outputs_coords = model(coords)
+            outputs_class, outputs_coords = model(coords, classes)
             outputs = {
                 'pred_logits': outputs_class,
-                'pred_boxes': outputs_coords
+                'pred_polylines': outputs_coords
             }
-            targets = [{'labels': classes[i], 'boxes': coords[i]} for i in range(len(num_points))]
+            targets = [{'labels': classes[i], 'polylines': coords[i]} for i in range(len(num_points))]
             loss_dict = criterion(outputs, targets)
             loss = sum(loss_dict.values())
 
