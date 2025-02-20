@@ -10,59 +10,29 @@
 
 - NF-VMap：矢量地图的众源多模融合端到端生成方案（关键词：端到端生成式神经网络、国产GPU）
 
-- ViTLR：基于车载单目视频的交通灯识别方案（关键词：端到端生成式神经网络、DRIVE Orin、RV1126）
+- ViTLR：基于车载视频流的交通灯识别方案（关键词：端到端生成式神经网络、DRIVE Orin、RV1126）
 
 ## 2. Publications（发表论文）
 
-- title: 基于国产 GPU 的众源矢量地图端到端融合生成技术
-  authors: 范淼, 刘宝, 肖旭, 江昆, 侯笑宇, 杜清运
-  url: 
-  source: 测绘学报. [Drafting]
+- 范淼, 刘宝, 肖旭, 江昆, 侯笑宇, 杜清运. 基于国产GPU的众源矢量地图端到端融合生成技术. 测绘学报. [Drafting]
 
-- title: Neural Generation of City-Scale Vectorized Maps by Crowdsourced Vehicles and Aerial Imagery
-  authors: Miao Fan, Xu Xiao, Kun Jiang, Haoyi Xiong
-  url: 
-  source: ITSC'25. [Drafting]
+- Miao Fan, Xu Xiao, Kun Jiang, Haoyi Xiong. Neural Generation of City-Scale Vectorized Maps by Crowdsourced Vehicles and Aerial Imagery. ITSC'25. [Drafting]
 
-- title: Learning to Generate Vectorized HD Maps at Intersections by Multiple Roadside Cameras
-  authors: Quanxin Zheng, Miao Fan, Shengtong Xu, Haoyi Xiong
-  url: 
-  source: IROS'25. [Submitted]
+- Quanxin Zheng, Miao Fan, Shengtong Xu, Haoyi Xiong. Learning to Generate Vectorized HD Maps at Intersections by Multiple Roadside Cameras. IROS'25. [Submitted]
 
-- title: Voice Prompt Generation through LLMs for In-Car Navigation
-  authors: Zebang Feng, Miao Fan, Shengtong Xu, Mingcheng Liao, Haoyi Xiong
-  url: 
-  source: ECML-PKDD'25. [Submitted]
+- Zebang Feng, Miao Fan, Shengtong Xu, Mingcheng Liao, Haoyi Xiong. Voice Prompt Generation through LLMs for In-Car Navigation. ECML-PKDD'25. [Submitted]
 
-- title: Multimodal HD Mapping for Intersections by Intelligent Roadside Units
-  authors: Zhongzhang Chen, Miao Fan, Shengtong Xu, Mengmeng Yang, Kun Jiang, Xiangzeng Liu, Haoyi Xiong
-  url: 
-  source: IV'25. [Submitted]
+- Zhongzhang Chen, Miao Fan, Shengtong Xu, Mengmeng Yang, Kun Jiang, Xiangzeng Liu, Haoyi Xiong. Multimodal HD Mapping for Intersections by Intelligent Roadside Units. IV'25. [Submitted]
 
-- title: A Benchmark for Vision-Centric HD Mapping by Cooperative V2I Systems
-  authors: Miao Fan, Shanshan Yu, Shengtong Xu, Kun Jiang, Xiangzeng Liu, Haoyi Xiong
-  url: 
-  source: IV'25. [Submitted]
+- Miao Fan, Shanshan Yu, Shengtong Xu, Kun Jiang, Xiangzeng Liu, Haoyi Xiong. A Benchmark for Vision-Centric HD Mapping by Cooperative V2I Systems. IV'25. [Submitted]
 
-- title: Semantic SLAM with Rolling-Shutter Cameras and Low-Precision INS in Outdoor Environments
-  authors: Yuchen Zhang, Miao Fan, Shengtong Xu, Xiangzeng Liu, Haoyi Xiong
-  url: 
-  source: IV'25. [Submitted]
+- Yuchen Zhang, Miao Fan, Shengtong Xu, Xiangzeng Liu, Haoyi Xiong. Semantic SLAM with Rolling-Shutter Cameras and Low-Precision INS in Outdoor Environments. IV'25. [Submitted]
 
-- title: Towards V2X HD Mapping：A Concise Review
-  authors: Xu Xiao, Suhui Yang, Miao Fan, Shengtong Xu, Xiangzeng Liu, Wenbo Hu, Haoyi Xiong 
-  url: 
-  source: IV'25. [Submitted]
+- Xu Xiao, Suhui Yang, Miao Fan, Shengtong Xu, Xiangzeng Liu, Wenbo Hu, Haoyi Xiong. Towards V2X HD Mapping：A Concise Review. IV'25. [Submitted]
 
-- title: A Concise Survey on Lane Topology Reasoning for HD Mapping
-  authors: Yi Yao, Miao Fan, Shengtong Xu, Haoyi Xiong, Xiangzeng Liu, Wenbo Hu, Wenbing Huang
-  url: 
-  source: IV'25. [Submitted]
+- Yi Yao, Miao Fan, Shengtong Xu, Haoyi Xiong, Xiangzeng Liu, Wenbo Hu, Wenbing Huang. A Concise Survey on Lane Topology Reasoning for HD Mapping. IV'25. [Submitted]
 
-- title: Video-based Traffic Light Recognition on Rockchip RV1126 for Autonomous Driving
-  authors: Miao Fan, Xuxu Kong, Shengtong Xu, Haoyi Xiong, Xiangzeng Liu 
-  url: 
-  source: IV'25. [Submitted]
+- Miao Fan, Xuxu Kong, Shengtong Xu, Haoyi Xiong, Xiangzeng Liu. Video-based Traffic Light Recognition on Rockchip RV1126 for Autonomous Driving. IV'25. [Submitted]
 
 ## 3. Patents（申请/授权专利）
 
