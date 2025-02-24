@@ -8,51 +8,185 @@ from scipy.optimize import linear_sum_assignment
 
 # 定义数据结构
 class VectorMap:
-    def __init__(self, trip_id, points):
+    def __init__(self, grid_id, orders):
         """
-        :param trip_id: 趟数_id
-        :param points: 矢量点列表，每个点为 {'point_id': int, 'x': float, 'y': float, 'class': int}
+        :param grid_id: 切块_id
+        :param orders: 订单列表，每个订单包含：
+                       - order_id: 订单ID
+                       - lines: 多边形列表，每个多边形是一个字典，包含：
+                                - points: 点列表，每个点为 {'x': float, 'y': float}
+                                - class: 类别（默认为0）
         """
-        self.trip_id = trip_id
-        self.points = points
+        self.grid_id = grid_id
+        self.orders = orders
 
 # 数据集类
+import os
+import re
+import torch
+from torch.utils.data import Dataset
+from collections import defaultdict
+
 class VectorMapDataset(Dataset):
-    def __init__(self, maps):
-        self.maps = maps
+    def __init__(self, data_folder, max_trips=5, max_lines=20, points_per_line=50):
+        """
+        :param data_folder: 包含vec和label子文件夹的根目录路径
+        :param max_trips: 单场景的最大趟数 (M_max)
+        :param max_lines: 单趟的最大车道线数 (L_max)
+        :param points_per_line: 每条车道线的采样点数 (N)
+        """
+        self.vec_folder = os.path.join(data_folder, "vec")
+        self.label_folder = os.path.join(data_folder, "label")
+        self.max_trips = max_trips
+        self.max_lines = max_lines
+        self.points_per_line = points_per_line
+        self.maps = self._load_data_from_folders()
 
     def __len__(self):
         return len(self.maps)
 
     def __getitem__(self, idx):
         map_data = self.maps[idx]
-        points = map_data.points
-        num_points = len(points)
+        vec_orders = map_data["vec_orders"]
+        label_orders = map_data["label_orders"]
+        bounds = map_data["bounds"]  # Bounds范围用于归一化
 
-        # 提取点的坐标和类别
-        coords = torch.tensor([[p['x'], p['y']] for p in points], dtype=torch.float32)
-        classes = torch.tensor([p['class'] for p in points], dtype=torch.long)
+        # 初始化输入张量和掩码矩阵
+        input_tensor = torch.zeros((self.max_trips, self.max_lines, self.points_per_line, 3))
+        label_tensor = torch.zeros((1, self.max_lines, self.points_per_line, 3)) # 真值认为是一趟，所以是(1, L_max, N, 3)
+        mask = torch.zeros((self.max_trips, self.max_lines, self.points_per_line), dtype=torch.bool)
+
+        # 处理原始矢量数据
+        for trip_idx, order in enumerate(vec_orders.values()):
+            if trip_idx >= self.max_trips:
+                break
+            for line_idx, line in enumerate(order["lines"]):
+                if line_idx >= self.max_lines:
+                    break
+                points = line["points"]
+                normalized_points = self._normalize_coordinates(points, bounds["x_min"], bounds["x_max"], bounds["y_min"], bounds["y_max"])
+                resampled_points = self._resample_points(normalized_points, self.points_per_line)
+                input_tensor[trip_idx, line_idx, :, :2] = torch.tensor([[p['x'], p['y']] for p in resampled_points])
+                input_tensor[trip_idx, line_idx, :, 2] = line["class"]
+                for p_idx in range(self.points_per_line):
+                    mask[trip_idx, line_idx, p_idx] = True
+
+        # 处理真值矢量数据
+        for trip_idx, order in enumerate(label_orders.values()):
+            if trip_idx >= self.max_trips:
+                break
+            for line_idx, line in enumerate(order["lines"]):
+                if line_idx >= self.max_lines:
+                    break
+                points = line["points"]
+                normalized_points = self._normalize_coordinates(points, bounds["x_min"], bounds["x_max"], bounds["y_min"], bounds["y_max"])
+                resampled_points = self._resample_points(normalized_points, self.points_per_line)
+                label_tensor[trip_idx, line_idx, :, :2] = torch.tensor([[p['x'], p['y']] for p in resampled_points])
+                label_tensor[trip_idx, line_idx, :, 2] = line["class"]
 
         return {
-            'coords': coords,  # [N, 2]
-            'classes': classes,  # [N]
-            'num_points': num_points
+            "input_tensor": input_tensor,  # 输入张量
+            "label_tensor": label_tensor,  # 真值张量
+            "mask": mask,  # 掩码矩阵
+            "bounds": bounds  # Bounds范围（可选，用于调试或反归一化）
         }
+
+    def _load_data_from_folders(self):
+        maps = []
+        vec_files = os.listdir(self.vec_folder)
+        label_files = os.listdir(self.label_folder)
+
+        for vec_file in vec_files:
+            if vec_file in label_files:
+                vec_path = os.path.join(self.vec_folder, vec_file)
+                label_path = os.path.join(self.label_folder, vec_file)
+                map_data = self._parse_files(vec_path, label_path)
+                maps.append(map_data)
+
+        return maps
+
+    def _parse_files(self, vec_path, label_path):
+        """
+        解析vec文件和label文件，生成VectorMap对象。
+        """
+        with open(vec_path, "r") as f:
+            vec_lines = f.readlines()
+
+        with open(label_path, "r") as f:
+            label_lines = f.readlines()
+
+        # 解析label文件中的Bounds
+        bounds_match = re.search(r"Bounds: \(([\d.]+), ([\d.]+), ([\d.]+), ([\d.]+)\)", "\n".join(label_lines))
+        if bounds_match:
+            x_min, y_min, x_max, y_max = map(float, bounds_match.groups())
+            bounds = {"x_min": x_min, "y_min": y_min, "x_max": x_max, "y_max": y_max}
+        else:
+            raise ValueError(f"Bounds not found in label file: {label_path}")
+
+        # 解析vec文件
+        vec_orders = defaultdict(lambda: {"order_id": None, "lines": []})
+        current_order_id = None
+        for line in vec_lines:
+            line = line.strip()
+            if line.startswith("OrderID:"):
+                current_order_id = int(line.split(":")[1].strip())
+                vec_orders[current_order_id]["order_id"] = current_order_id
+            elif line.startswith("LINESTRING"):
+                points_str = re.findall(r"\((.*?)\)", line)[0]
+                points = [{"x": float(coord.split()[0]), "y": float(coord.split()[1])} for coord in points_str.split(", ")]
+                vec_orders[current_order_id]["lines"].append({"points": points, "class": 0})
+
+        # 解析label文件
+        label_orders = defaultdict(lambda: {"order_id": None, "lines": []})
+        current_order_id = None
+        for line in label_lines:
+            line = line.strip()
+            if line.startswith("OrderID:"):
+                current_order_id = int(line.split(":")[1].strip())
+                label_orders[current_order_id]["order_id"] = current_order_id
+            elif line.startswith("LINESTRING"):
+                points_str = re.findall(r"\((.*?)\)", line)[0]
+                points = [{"x": float(coord.split()[0]), "y": float(coord.split()[1])} for coord in points_str.split(", ")]
+                label_orders[current_order_id]["lines"].append({"points": points, "class": 0})
+
+        return {
+            "vec_orders": vec_orders, 
+            "label_orders": label_orders, 
+            "bounds": bounds
+        }
+
+    def _normalize_coordinates(self, points, x_min, x_max, y_min, y_max):
+        normalized_points = []
+        for point in points:
+            x = (point['x'] - x_min) / (x_max - x_min) * 2 - 1  # 归一化到 [-1, 1]
+            y = (point['y'] - y_min) / (y_max - y_min) * 2 - 1  # 归一化到 [-1, 1]
+            normalized_points.append({'x': x, 'y': y})
+        return normalized_points
+
+    def _resample_points(self, points, num_points):
+        if len(points) > num_points:
+            # 如果点数过多，均匀采样
+            indices = torch.linspace(0, len(points) - 1, num_points).long()
+            resampled_points = [points[i] for i in indices]
+        else:
+            # 如果点数不足，重复填充
+            resampled_points = points * (num_points // len(points)) + points[:num_points % len(points)]
+        return resampled_points
 
 
 # Transformer模型
 class MapTransformer(nn.Module):
-    def __init__(self, hidden_dim=256, num_heads=8, num_encoder_layers=6, num_decoder_layers=6, num_queries=100, num_classes=10, max_points=50):
+    def __init__(self, hidden_dim=256, num_heads=8, num_encoder_layers=6, num_decoder_layers=6, num_queries=100, num_classes=10, max_trips=5, max_lines=20, points_per_line=50):
         super(MapTransformer, self).__init__()
         self.hidden_dim = hidden_dim
         self.num_queries = num_queries
-        self.max_points = max_points
+        self.max_trips = max_trips
+        self.max_lines = max_lines
+        self.points_per_line = points_per_line
 
         # 嵌入层
-        self.input_proj = nn.Linear(2, hidden_dim)
+        self.input_proj = nn.Linear(2, hidden_dim)  # 输入特征维度为2 (x, y)
         self.class_embed = nn.Embedding(num_classes, hidden_dim)
-        # 条件层
-        self.conditional_layer = nn.Linear(hidden_dim, hidden_dim)
 
         # Transformer
         self.transformer = nn.Transformer(d_model=hidden_dim, nhead=num_heads,
@@ -64,24 +198,30 @@ class MapTransformer(nn.Module):
 
         # 输出层
         self.class_head = nn.Linear(hidden_dim, num_classes + 1)
-        self.polyline_head = nn.Linear(hidden_dim, max_points * 2)  # 每个点有 (x, y) 两个坐标
+        self.polyline_head = nn.Linear(hidden_dim, points_per_line * 2)  # 输出坐标
 
-    def forward(self, coords, classes):
+    def forward(self, input_tensor, mask):
+        # 输入张量形状：[B, M, L_max, N, 3]
+        B, M, L_max, N, _ = input_tensor.shape
+
+        # 展平输入张量以适应Transformer
+        input_tensor = input_tensor.view(B, M * L_max * N, 3)  # [B, M * L_max * N, 3]
+        mask = mask.view(B, M * L_max * N)  # [B, M * L_max * N]
+
         # 嵌入
-        coord_embed = self.input_proj(coords)  # [N, hidden_dim]
-        class_embed = self.class_embed(classes)  # [N, hidden_dim]
-        # 条件调整
-        conditional_embed = self.conditional_layer(class_embed)  # [N, hidden_dim]
-        combined_embed = coord_embed + conditional_embed  # 条件调整后的嵌入
+        coord_embed = self.input_proj(input_tensor[..., :2])  # [B, M * L_max * N, hidden_dim]
+        class_embed = self.class_embed(input_tensor[..., 2].long())  # [B, M * L_max * N, hidden_dim]
+        combined_embed = coord_embed + class_embed  # [B, M * L_max * N, hidden_dim]
 
         # Transformer 输入
         src = combined_embed.permute(1, 0, 2)  # [seq_len, batch_size, hidden_dim]
-        tgt = self.query_embed.weight.unsqueeze(1).repeat(1, src.size(1), 1)  # [num_queries, batch_size, hidden_dim]
-        hs = self.transformer(src, tgt)  # Transformer 输出
+        tgt = self.query_embed.weight.unsqueeze(1).repeat(1, B, 1)  # [num_queries, batch_size, hidden_dim]
+        hs = self.transformer(src, tgt, src_key_padding_mask=mask)  # Transformer 输出
 
         # 输出预测
-        outputs_class = self.class_head(hs)
-        outputs_polylines = self.polyline_head(hs).view(-1, self.max_points, 2)  # [num_queries, max_points, 2]
+        outputs_class = self.class_head(hs)  # [num_queries, B, num_classes + 1]
+        outputs_polylines = self.polyline_head(hs).view(self.num_queries, B * self.points_per_line, 2)  # [num_queries, B * N, 2]
+
         return outputs_class, outputs_polylines
 
 # 匈牙利匹配器
@@ -187,49 +327,32 @@ class SetCriterion(nn.Module):
         losses.update(self.loss_polylines(outputs, targets, indices, num_boxes))
         return losses
 
-# 辅助函数
-def generalized_box_iou(boxes1, boxes2):
-    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
-    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
-    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])  # [N,M,2]
-    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])  # [N,M,2]
-    wh = (rb - lt).clamp(min=0)  # [N,M,2]
-    inter = wh[:, :, 0] * wh[:, :, 1]  # [N,M]
-    union = area1[:, None] + area2 - inter
-    iou = inter / union
 
-    lt = torch.min(boxes1[:, None, :2], boxes2[:, :2])
-    rb = torch.max(boxes1[:, None, 2:], boxes2[:, 2:])
-    wh = (rb - lt).clamp(min=0)
-    area = wh[:, :, 0] * wh[:, :, 1]
-    return iou - (area - union) / area
-
-def box_cxcywh_to_xyxy(x):
-    x_c, y_c, w, h = x.unbind(1)
-    b = [(x_c - 0.5 * w), (y_c - 0.5 * h),
-         (x_c + 0.5 * w), (y_c + 0.5 * h)]
-    return torch.stack(b, dim=1)
+def normalize_coordinates(points, x_min, x_max, y_min, y_max):
+    """
+    对坐标点进行归一化处理。
+    :param points: 点列表，每个点为 {'x': float, 'y': float}
+    :param x_min: x坐标的最小值
+    :param x_max: x坐标的最大值
+    :param y_min: y坐标的最小值
+    :param y_max: y坐标的最大值
+    :return: 归一化后的点列表
+    """
+    normalized_points = []
+    for point in points:
+        x = (point['x'] - x_min) / (x_max - x_min)
+        y = (point['y'] - y_min) / (y_max - y_min)
+        normalized_points.append({'x': x, 'y': y})
+    return normalized_points
 
 # 主函数
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 示例数据
-    maps = [
-        VectorMap(trip_id=1, points=[
-            {'point_id': 1, 'x': 0.1, 'y': 0.2, 'class': 0},
-            {'point_id': 2, 'x': 0.3, 'y': 0.4, 'class': 1}
-        ]),
-        VectorMap(trip_id=2, points=[
-            {'point_id': 1, 'x': 0.2, 'y': 0.3, 'class': 0},
-            {'point_id': 2, 'x': 0.4, 'y': 0.5, 'class': 1}
-        ])
-    ]
+    dataset = VectorMapDataset("D:\\NF-VMap\\dataset\\train_grids", max_trips=5, max_lines=10, points_per_line=10)
+    dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
 
-    dataset = VectorMapDataset(maps)
-    dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
-
-    model = MapTransformer().to(device)
+    model = MapTransformer(max_trips=5, max_lines=10, points_per_line=10).to(device)
     matcher = HungarianMatcher(cost_class=1, cost_polyline=1)
     criterion = SetCriterion(num_classes=2, matcher=matcher, weight_dict={'loss_ce': 1, 'loss_polyline': 1})
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
@@ -237,16 +360,21 @@ if __name__ == "__main__":
     for epoch in range(10):
         model.train()
         for batch in dataloader:
-            coords = batch['coords'].to(device)
-            classes = batch['classes'].to(device)
-            num_points = batch['num_points']
+            input_tensor = batch['input_tensor'].to(device)
+            label_tensor = batch['label_tensor'].to(device)
+            mask = batch['mask'].to(device)
 
-            outputs_class, outputs_coords = model(coords, classes)
+            outputs_class, outputs_coords = model(input_tensor, mask)
             outputs = {
                 'pred_logits': outputs_class,
                 'pred_polylines': outputs_coords
             }
-            targets = [{'labels': classes[i], 'polylines': coords[i]} for i in range(len(num_points))]
+
+            # 提取类别标签和坐标
+            label_classes = label_tensor[..., 2].long()  # 类别标签在最后一个维度
+            label_coords = label_tensor[..., :2]  # 坐标在前两个维度
+
+            targets = [{'labels': label_classes[b].view(-1), 'polylines': label_coords[b].view(-1, 2)} for b in range(label_classes.size(0))]
             loss_dict = criterion(outputs, targets)
             loss = sum(loss_dict.values())
 
