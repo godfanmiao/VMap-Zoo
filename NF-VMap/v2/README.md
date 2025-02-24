@@ -1,9 +1,9 @@
 # NF-VMAP(v2):矢量地图的众源多模融合端到端生成技术
 
-## Introduction
+## Introduction（介绍）
 
-## Deployment
+## Deployment（训练和部署方法）
 
-## Publications
-Neural Generation of City-Scale Vectorized Maps by Crowdsourced Vehicles and Aerial Imagery
-## Patents
+## Publications（发表论文）
+
+## Patents（授权专利）

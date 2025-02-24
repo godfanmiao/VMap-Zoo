@@ -1,9 +1,9 @@
 # I-VMAP: 路侧多相机联合生成矢量地图的边缘计算方法
 
-## Introduction
+## Introduction（介绍）
 
-## Deployment
+## Deployment（训练和部署方法）
 
-## Publications
+## Publications（发表论文）
 
-## Patents
+## Patents（授权专利）
