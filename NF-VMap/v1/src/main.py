@@ -1,3 +1,6 @@
+import os
+import re
+from collections import defaultdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -6,27 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
-# 定义数据结构
-class VectorMap:
-    def __init__(self, grid_id, orders):
-        """
-        :param grid_id: 切块_id
-        :param orders: 订单列表，每个订单包含：
-                       - order_id: 订单ID
-                       - lines: 多边形列表，每个多边形是一个字典，包含：
-                                - points: 点列表，每个点为 {'x': float, 'y': float}
-                                - class: 类别（默认为0）
-        """
-        self.grid_id = grid_id
-        self.orders = orders
-
 # 数据集类
-import os
-import re
-import torch
-from torch.utils.data import Dataset
-from collections import defaultdict
-
 class VectorMapDataset(Dataset):
     def __init__(self, data_folder, max_trips=5, max_lines=20, points_per_line=50):
         """
@@ -197,8 +180,8 @@ class MapTransformer(nn.Module):
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
 
         # 输出层
-        self.class_head = nn.Linear(hidden_dim, num_classes + 1)
-        self.polyline_head = nn.Linear(hidden_dim, points_per_line * 2)  # 输出坐标
+        self.class_head = nn.Linear(hidden_dim, max_lines * (num_classes + 1))
+        self.polyline_head = nn.Linear(hidden_dim, max_lines * points_per_line * 2)  # 输出坐标
 
     def forward(self, input_tensor, mask):
         # 输入张量形状：[B, M, L_max, N, 3]
@@ -219,8 +202,8 @@ class MapTransformer(nn.Module):
         hs = self.transformer(src, tgt, src_key_padding_mask=mask)  # Transformer 输出
 
         # 输出预测
-        outputs_class = self.class_head(hs)  # [num_queries, B, num_classes + 1]
-        outputs_polylines = self.polyline_head(hs).view(self.num_queries, B * self.points_per_line, 2)  # [num_queries, B * N, 2]
+        outputs_class = self.class_head(hs)  # [num_queries, B, L_max * (num_classes + 1)]
+        outputs_polylines = self.polyline_head(hs).view(self.num_queries, B * self.max_lines * self.points_per_line, 2)  # [num_queries, B * L_max * N, 2]
 
         return outputs_class, outputs_polylines
 
@@ -352,9 +335,9 @@ if __name__ == "__main__":
     dataset = VectorMapDataset("D:\\NF-VMap\\dataset\\train_grids", max_trips=5, max_lines=10, points_per_line=10)
     dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
 
-    model = MapTransformer(max_trips=5, max_lines=10, points_per_line=10).to(device)
+    model = MapTransformer(max_trips=5, max_lines=10, points_per_line=10, num_queries=100, num_classes=3).to(device)
     matcher = HungarianMatcher(cost_class=1, cost_polyline=1)
-    criterion = SetCriterion(num_classes=2, matcher=matcher, weight_dict={'loss_ce': 1, 'loss_polyline': 1})
+    criterion = SetCriterion(num_classes=3, matcher=matcher, weight_dict={'loss_ce': 1, 'loss_polyline': 1})
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
 
     for epoch in range(10):
