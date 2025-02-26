@@ -182,7 +182,7 @@ class MapTransformer(nn.Module):
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
 
         # 输出层
-        self.class_head = nn.Linear(hidden_dim, max_lines * (num_classes + 1))
+        self.class_head = nn.Linear(hidden_dim, max_lines * points_per_line * (num_classes + 1))
         self.polyline_head = nn.Linear(hidden_dim, max_lines * points_per_line * 2)  # 输出坐标
 
     def forward(self, input_tensor, mask):
@@ -206,7 +206,7 @@ class MapTransformer(nn.Module):
         hs = self.transformer(src, tgt, src_key_padding_mask=mask)  # Transformer 输出
 
         # 输出预测
-        outputs_class = self.class_head(hs)  # [num_queries, B, L_max * (num_classes + 1)]
+        outputs_class = self.class_head(hs)  # [num_queries, B, L_max * N * (num_classes + 1)]
         outputs_polylines = self.polyline_head(hs).view(self.num_queries, B * self.max_lines * self.points_per_line, 2)  # [num_queries, B * L_max * N, 2]
 
         return outputs_class, outputs_polylines
@@ -304,8 +304,7 @@ class SetCriterion(nn.Module):
         return batch_idx, src_idx
 
     def forward(self, outputs, targets):
-        outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs'}
-        indices = self.matcher(outputs_without_aux, targets)
+        indices = self.matcher(outputs, targets)
         num_boxes = sum(len(t["labels"]) for t in targets)
         num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
         num_boxes = torch.clamp(num_boxes, min=1).item()
