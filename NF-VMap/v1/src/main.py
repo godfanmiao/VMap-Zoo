@@ -244,15 +244,15 @@ class HungarianMatcher(nn.Module):
 
     def forward(self, outputs, targets):
         with torch.no_grad():
-            bs, num_queries = outputs["pred_logits"].shape[:2]
-            out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # [batch_size * num_queries, num_classes + 1]
+            num_queries, bs = outputs["pred_logits"].shape[:2]
+            out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # [batch_size * num_queries, L_max * N * (num_classes + 1)]
             out_polylines = outputs["pred_polylines"]  # [batch_size * num_queries, max_points, 2]
 
-            tgt_ids = torch.cat([t["labels"] for t in targets])  # [num_targets]
-            tgt_polylines = torch.cat([t["polylines"] for t in targets], dim=0)  # [num_targets, max_points, 2]
+            tgt_ids = torch.cat([t["labels"] for t in targets])  # [batch_size * L_max * N]
+            tgt_polylines = torch.cat([t["polylines"] for t in targets], dim=0)  # [batch_size * L_max * N, 2]
 
             # 分类成本
-            cost_class = -out_prob[:, tgt_ids]  # [batch_size * num_queries, num_targets]
+            cost_class = -out_prob[:, tgt_ids]  # [batch_size * num_queries, batch_size * L_max * N]
 
             # polyline 距离成本
             cost_polyline = torch.zeros_like(cost_class)
@@ -301,7 +301,7 @@ class SetCriterion(nn.Module):
     def _get_src_permutation_idx(self, indices):
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         src_idx = torch.cat([src for (src, _) in indices])
-        return batch_idx, src_idx
+        return src_idx, batch_idx
 
     def forward(self, outputs, targets):
         indices = self.matcher(outputs, targets)
@@ -336,9 +336,9 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dataset = VectorMapDataset("D:\\NF-VMap\\dataset\\train_grids", max_trips=5, max_lines=10, points_per_line=10)
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=7, shuffle=False)
 
-    model = MapTransformer(max_trips=5, max_lines=10, points_per_line=10, num_queries=100, num_classes=3).to(device)
+    model = MapTransformer(max_trips=5, max_lines=10, points_per_line=10, num_queries=8, num_classes=3).to(device)
     matcher = HungarianMatcher(cost_class=1, cost_polyline=1)
     criterion = SetCriterion(num_classes=3, matcher=matcher, weight_dict={'loss_ce': 1, 'loss_polyline': 1})
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
