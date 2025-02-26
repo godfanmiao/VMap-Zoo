@@ -170,6 +170,8 @@ class MapTransformer(nn.Module):
         # 嵌入层
         self.input_proj = nn.Linear(2, hidden_dim)  # 输入特征维度为2 (x, y)
         self.class_embed = nn.Embedding(num_classes, hidden_dim)
+        # 条件层
+        self.conditional_layer = nn.Linear(hidden_dim, hidden_dim)
 
         # Transformer
         self.transformer = nn.Transformer(d_model=hidden_dim, nhead=num_heads,
@@ -194,7 +196,9 @@ class MapTransformer(nn.Module):
         # 嵌入
         coord_embed = self.input_proj(input_tensor[..., :2])  # [B, M * L_max * N, hidden_dim]
         class_embed = self.class_embed(input_tensor[..., 2].long())  # [B, M * L_max * N, hidden_dim]
-        combined_embed = coord_embed + class_embed  # [B, M * L_max * N, hidden_dim]
+        # 条件调整
+        conditional_embed = self.conditional_layer(class_embed)  # [N, hidden_dim]
+        combined_embed = coord_embed + conditional_embed  # [B, M * L_max * N, hidden_dim]
 
         # Transformer 输入
         src = combined_embed.permute(1, 0, 2)  # [seq_len, batch_size, hidden_dim]
