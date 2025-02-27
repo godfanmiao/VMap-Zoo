@@ -182,8 +182,8 @@ class MapTransformer(nn.Module):
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
 
         # 输出层
-        self.class_head = nn.Linear(hidden_dim, max_lines * points_per_line * (num_classes + 1))
-        self.polyline_head = nn.Linear(hidden_dim, max_lines * points_per_line * 2)  # 输出坐标
+        self.class_head = nn.Linear(hidden_dim, (num_classes + 1))
+        self.polyline_head = nn.Linear(hidden_dim, points_per_line * 2)  # 输出坐标
 
     def forward(self, input_tensor, mask):
         # 输入张量形状：[B, M, L_max, N, 3]
@@ -206,8 +206,8 @@ class MapTransformer(nn.Module):
         hs = self.transformer(src, tgt, src_key_padding_mask=mask)  # Transformer 输出
 
         # 输出预测
-        outputs_class = self.class_head(hs)  # [num_queries, B, L_max * N * (num_classes + 1)]
-        outputs_polylines = self.polyline_head(hs).view(self.num_queries, B * self.max_lines * self.points_per_line, 2)  # [num_queries, B * L_max * N, 2]
+        outputs_class = self.class_head(hs)  # [num_queries, B, (num_classes + 1)]
+        outputs_polylines = self.polyline_head(hs).view(self.num_queries, B * self.points_per_line, 2)  # [num_queries, B * N, 2]
 
         return outputs_class, outputs_polylines
 
@@ -336,9 +336,9 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dataset = VectorMapDataset("D:\\NF-VMap\\dataset\\train_grids", max_trips=5, max_lines=10, points_per_line=10)
-    dataloader = DataLoader(dataset, batch_size=7, shuffle=False)
+    dataloader = DataLoader(dataset, batch_size=8, shuffle=False)
 
-    model = MapTransformer(max_trips=5, max_lines=10, points_per_line=10, num_queries=8, num_classes=3).to(device)
+    model = MapTransformer(max_trips=5, max_lines=10, points_per_line=10, num_queries=6, num_classes=3).to(device)
     matcher = HungarianMatcher(cost_class=1, cost_polyline=1)
     criterion = SetCriterion(num_classes=3, matcher=matcher, weight_dict={'loss_ce': 1, 'loss_polyline': 1})
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
