@@ -31,12 +31,12 @@ class VectorMapDataset(Dataset):
     def __getitem__(self, idx):
         map_data = self.maps[idx]
         vec_orders = map_data["vec_orders"]
-        label_orders = map_data["label_orders"]
+        label_order_lines = map_data["label_order_lines"]
         bounds = map_data["bounds"]  # Bounds范围用于归一化
 
         # 初始化输入张量和掩码矩阵
         input_tensor = torch.zeros((self.max_trips, self.max_lines, self.points_per_line, 3))
-        label_tensor = torch.zeros((1, self.max_lines, self.points_per_line, 3)) # 真值认为是一趟，所以是(1, L_max, N, 3)
+        label_tensor = torch.zeros((len(label_order_lines), self.points_per_line, 3))  # 真值认为是一趟，所以是(len(label_orders), N, 3)
         mask = torch.zeros((self.max_trips, self.max_lines, self.points_per_line), dtype=torch.bool)
 
         # 处理原始矢量数据
@@ -55,17 +55,12 @@ class VectorMapDataset(Dataset):
                     mask[trip_idx, line_idx, p_idx] = True
 
         # 处理真值矢量数据
-        for trip_idx, order in enumerate(label_orders.values()):
-            if trip_idx >= self.max_trips:
-                break
-            for line_idx, line in enumerate(order["lines"]):
-                if line_idx >= self.max_lines:
-                    break
-                points = line["points"]
-                normalized_points = self._normalize_coordinates(points, bounds["x_min"], bounds["x_max"], bounds["y_min"], bounds["y_max"])
-                resampled_points = self._resample_points(normalized_points, self.points_per_line)
-                label_tensor[trip_idx, line_idx, :, :2] = torch.tensor([[p['x'], p['y']] for p in resampled_points])
-                label_tensor[trip_idx, line_idx, :, 2] = line["class"]
+        for line_idx, line in enumerate(label_order_lines):  # 假设真值只有一趟
+            points = line["points"]
+            normalized_points = self._normalize_coordinates(points, bounds["x_min"], bounds["x_max"], bounds["y_min"], bounds["y_max"])
+            resampled_points = self._resample_points(normalized_points, self.points_per_line)
+            label_tensor[line_idx, :, :2] = torch.tensor([[p['x'], p['y']] for p in resampled_points])
+            label_tensor[line_idx, :, 2] = line["class"]
 
         return {
             "input_tensor": input_tensor,  # 输入张量
@@ -120,21 +115,17 @@ class VectorMapDataset(Dataset):
                 vec_orders[current_order_id]["lines"].append({"points": points, "class": 0})
 
         # 解析label文件
-        label_orders = defaultdict(lambda: {"order_id": None, "lines": []})
-        current_order_id = None
+        label_order_lines = []
         for line in label_lines:
             line = line.strip()
-            if line.startswith("OrderID:"):
-                current_order_id = int(line.split(":")[1].strip())
-                label_orders[current_order_id]["order_id"] = current_order_id
-            elif line.startswith("LINESTRING"):
+            if line.startswith("LINESTRING"):
                 points_str = re.findall(r"\((.*?)\)", line)[0]
                 points = [{"x": float(coord.split()[0]), "y": float(coord.split()[1])} for coord in points_str.split(", ")]
-                label_orders[current_order_id]["lines"].append({"points": points, "class": 0})
+                label_order_lines.append({"points": points, "class": 0})
 
         return {
             "vec_orders": vec_orders, 
-            "label_orders": label_orders, 
+            "label_order_lines": label_order_lines, 
             "bounds": bounds
         }
 
@@ -331,14 +322,60 @@ def normalize_coordinates(points, x_min, x_max, y_min, y_max):
         normalized_points.append({'x': x, 'y': y})
     return normalized_points
 
+def collate_fn(batch):
+    """
+    自定义collate_fn，用于处理不同长度的label_tensor。
+    :param batch: 一个列表，每个元素是一个样本，由__getitem__返回。
+    :return: 一个字典，包含堆叠后的输入张量、填充后的标签张量、掩码矩阵等。
+    """
+    # 提取每个样本的输入张量、标签张量、掩码矩阵和Bounds
+    input_tensors = [item["input_tensor"] for item in batch]
+    label_tensors = [item["label_tensor"] for item in batch]
+    masks = [item["mask"] for item in batch]
+    bounds = [item["bounds"] for item in batch]
+
+    # 计算每个样本的标签数量
+    label_lengths = [len(t) for t in label_tensors]
+
+    # 找到最大标签数量
+    max_label_length = max(label_lengths)
+
+    # 填充label_tensor到最大长度
+    padded_label_tensors = []
+    label_masks = []
+    for label_tensor, length in zip(label_tensors, label_lengths):
+        # 填充零到最大长度
+        padded_label_tensor = torch.zeros((max_label_length, label_tensor.shape[1], label_tensor.shape[2]))
+        padded_label_tensor[:length] = label_tensor
+        padded_label_tensors.append(padded_label_tensor)
+
+        # 创建掩码矩阵
+        label_mask = torch.zeros(max_label_length, dtype=torch.bool)
+        label_mask[:length] = True
+        label_masks.append(label_mask)
+
+    # 将输入张量堆叠成一个批次
+    input_tensors = torch.stack(input_tensors, dim=0)
+    masks = torch.stack(masks, dim=0)
+    label_masks = torch.stack(label_masks, dim=0)
+    padded_label_tensors = torch.stack(padded_label_tensors, dim=0)
+
+    return {
+        "input_tensor": input_tensors,
+        "label_tensor": padded_label_tensors,
+        "mask": masks,
+        "label_mask": label_masks,
+        "bounds": bounds
+    }
+
 # 主函数
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     dataset = VectorMapDataset("D:\\NF-VMap\\dataset\\train_grids", max_trips=5, max_lines=10, points_per_line=10)
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=False)
+    dataloader = DataLoader(dataset, batch_size=8, shuffle=False, collate_fn=collate_fn)
 
-    model = MapTransformer(max_trips=5, max_lines=10, points_per_line=10, num_queries=6, num_classes=3).to(device)
+    model = MapTransformer(max_trips=5, max_lines=10, points_per_line=10, num_queries=20, num_classes=3).to(device)
     matcher = HungarianMatcher(cost_class=1, cost_polyline=1)
     criterion = SetCriterion(num_classes=3, matcher=matcher, weight_dict={'loss_ce': 1, 'loss_polyline': 1})
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
