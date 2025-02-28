@@ -75,7 +75,7 @@ class VectorMapDataset(Dataset):
         label_files = os.listdir(self.label_folder)
 
         for vec_file in vec_files:
-            if vec_file in label_files:
+            if vec_file in label_files and vec_file.endswith('.txt'):
                 vec_path = os.path.join(self.vec_folder, vec_file)
                 label_path = os.path.join(self.label_folder, vec_file)
                 map_data = self._parse_files(vec_path, label_path)
@@ -385,17 +385,26 @@ if __name__ == "__main__":
     save_dir = "checkpoints"  # 模型保存路径
     os.makedirs(save_dir, exist_ok=True)
 
-    dataset = VectorMapDataset("D:\\NF-VMap\\dataset\\train_grids", max_trips=5, max_lines=10, points_per_line=10)
-    dataloader = DataLoader(dataset, batch_size=20, shuffle=True, collate_fn=collate_fn)
+    total_epochs = 100  # 总训练轮数
 
-    model = MapTransformer(max_trips=5, max_lines=10, points_per_line=10, num_queries=10, num_classes=3).to(device)
+    max_trips = 5  # 每个样本的最大趟数
+    max_lines = 10  # 每趟的最大线段数
+    points_per_line = 10  # 每条线段的最大点数
+
+    train_dataset = VectorMapDataset("/Users/liubao/Downloads/NF-VMap/dataset/train", max_trips, max_lines, points_per_line)
+    val_dataset = VectorMapDataset("/Users/liubao/Downloads/NF-VMap/dataset/val", max_trips, max_lines, points_per_line)
+    train_dataloader = DataLoader(train_dataset, batch_size=20, shuffle=True, collate_fn=collate_fn)
+    val_dataloader = DataLoader(val_dataset, batch_size=5, shuffle=False, collate_fn=collate_fn)
+
+    model = MapTransformer(max_trips=max_trips, max_lines=max_lines, points_per_line=10, num_queries=20, num_classes=3).to(device)
     matcher = HungarianMatcher(cost_class=1, cost_polyline=1)
     criterion = SetCriterion(num_classes=3, matcher=matcher, weight_dict={'loss_ce': 1, 'loss_polyline': 1})
-    optimizer = optim.Adam(model.parameters(), lr=1e-4)
+    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=5e-5)
 
-    for epoch in range(10):
+    for epoch in range(total_epochs):
         model.train()
-        for batch in dataloader:
+        for batch in train_dataloader:
             input_tensor = batch['input_tensor'].to(device)
             label_tensor = batch['label_tensor'].to(device)
             mask = batch['mask'].to(device)
@@ -420,6 +429,35 @@ if __name__ == "__main__":
 
             print(f"Epoch {epoch + 1}, Loss: {loss_dict}")
             print(f"Epoch {epoch + 1}, Loss: {loss.item():.4f}")
+        scheduler.step()
+        print(f"Epoch {epoch + 1}, Learning Rate: {scheduler.get_last_lr()}")
+
+        # 验证阶段
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for batch in val_dataloader:
+                input_tensor = batch['input_tensor'].to(device)
+                label_tensor = batch['label_tensor'].to(device)
+                mask = batch['mask'].to(device)
+
+                outputs_class, outputs_coords = model(input_tensor, mask)
+                outputs = {
+                    'pred_logits': outputs_class,
+                    'pred_polylines': outputs_coords
+                }
+
+                label_classes = label_tensor[..., 2].long()
+                label_coords = label_tensor[..., :2]
+
+                targets = [{'labels': label_classes[b].t()[0], 'polylines': label_coords[b].view(-1, 10, 2)} for b in range(label_classes.size(0))]
+                loss_dict = criterion(outputs, targets)
+                loss = sum(loss_dict.values())
+                val_loss += loss.item()
+
+        val_loss /= len(val_dataloader)
+        print(f"Epoch {epoch + 1}, Val Loss: {val_loss:.4f}")
+
 
         # 每个epoch保存一次模型
         torch.save(model.state_dict(), os.path.join(save_dir, f"model_epoch_{epoch + 1}.pth"))
