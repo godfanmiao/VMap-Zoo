@@ -115,13 +115,14 @@ class VectorMapDataset(Dataset):
                 vec_orders[current_order_id]["lines"].append({"points": points, "class": 0})
 
         # 解析label文件
-        label_order_lines = []
-        for line in label_lines:
-            line = line.strip()
-            if line.startswith("LINESTRING"):
-                points_str = re.findall(r"\((.*?)\)", line)[0]
-                points = [{"x": float(coord.split()[0]), "y": float(coord.split()[1])} for coord in points_str.split(", ")]
-                label_order_lines.append({"points": points, "class": 0})
+        label_order_lines = vec_orders[current_order_id]["lines"]
+        # label_order_lines = []
+        # for line in label_lines:
+        #     line = line.strip()
+        #     if line.startswith("LINESTRING"):
+        #         points_str = re.findall(r"\((.*?)\)", line)[0]
+        #         points = [{"x": float(coord.split()[0]), "y": float(coord.split()[1])} for coord in points_str.split(", ")]
+        #         label_order_lines.append({"points": points, "class": 0})
 
         return {
             "vec_orders": vec_orders, 
@@ -130,10 +131,19 @@ class VectorMapDataset(Dataset):
         }
 
     def _normalize_coordinates(self, points, x_min, x_max, y_min, y_max):
+        """
+        对坐标点进行归一化处理。
+        :param points: 点列表，每个点为 {'x': float, 'y': float}
+        :param x_min: x坐标的最小值
+        :param x_max: x坐标的最大值
+        :param y_min: y坐标的最小值
+        :param y_max: y坐标的最大值
+        :return: 归一化后的点列表
+        """
         normalized_points = []
         for point in points:
-            x = (point['x'] - x_min) / (x_max - x_min) * 2 - 1  # 归一化到 [-1, 1]
-            y = (point['y'] - y_min) / (y_max - y_min) * 2 - 1  # 归一化到 [-1, 1]
+            x = (point['x'] - x_min) / (x_max - x_min)
+            y = (point['y'] - y_min) / (y_max - y_min)
             normalized_points.append({'x': x, 'y': y})
         return normalized_points
 
@@ -198,7 +208,7 @@ class MapTransformer(nn.Module):
 
         # 输出预测
         outputs_class = self.class_head(hs)  # [num_queries, B, (num_classes + 1)]
-        outputs_polylines = self.polyline_head(hs).view(self.num_queries, B * self.points_per_line, 2)  # [num_queries, B * N, 2]
+        outputs_polylines = self.polyline_head(hs).sigmoid().view(self.num_queries, B, self.points_per_line, 2)  # [num_queries, B, N, 2]
 
         return outputs_class, outputs_polylines
 
@@ -223,7 +233,7 @@ class HungarianMatcher(nn.Module):
             polyline2 = polyline2.unsqueeze(0)  # 将形状从 [2] 转换为 [1, 2]
 
         # 计算点到点的距离矩阵
-        dist_matrix = torch.cdist(polyline1, polyline2, p=2)  # Shape: [num_points1, num_points2]
+        dist_matrix = torch.cdist(polyline1.view(-1, 2), polyline2.view(-1, 2), p=1)  # Shape: [num_points1, num_points2]
 
         # 计算 polyline1 到 polyline2 的最小距离
         min_dist1 = dist_matrix.min(dim=1).values.mean()
@@ -236,14 +246,14 @@ class HungarianMatcher(nn.Module):
     def forward(self, outputs, targets):
         with torch.no_grad():
             num_queries, bs = outputs["pred_logits"].shape[:2]
-            out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # [batch_size * num_queries, L_max * N * (num_classes + 1)]
-            out_polylines = outputs["pred_polylines"]  # [batch_size * num_queries, max_points, 2]
+            out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # [batch_size * num_queries, (num_classes + 1)]
+            out_polylines = outputs["pred_polylines"].flatten(0, 1)  # [batch_size * num_queries, max_points, 2]
 
-            tgt_ids = torch.cat([t["labels"] for t in targets])  # [batch_size * L_max * N]
-            tgt_polylines = torch.cat([t["polylines"] for t in targets], dim=0)  # [batch_size * L_max * N, 2]
+            tgt_ids = torch.cat([t["labels"] for t in targets])  # [batch_size * L_max]
+            tgt_polylines = torch.cat([t["polylines"] for t in targets], dim=0)  # [batch_size * L_max , N, 2]
 
             # 分类成本
-            cost_class = -out_prob[:, tgt_ids]  # [batch_size * num_queries, batch_size * L_max * N]
+            cost_class = -out_prob[:, tgt_ids]  # [batch_size * num_queries, batch_size * L_max]
 
             # polyline 距离成本
             cost_polyline = torch.zeros_like(cost_class)
@@ -269,7 +279,7 @@ class SetCriterion(nn.Module):
         self.weight_dict = weight_dict
         self.eos_coef = eos_coef
 
-    def loss_labels(self, outputs, targets, indices, num_boxes):
+    def loss_labels(self, outputs, targets, indices, num_polylines):
         src_logits = outputs['pred_logits']
         idx = self._get_src_permutation_idx(indices)
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
@@ -280,13 +290,13 @@ class SetCriterion(nn.Module):
         losses = {'loss_ce': loss_ce}
         return losses
 
-    def loss_polylines(self, outputs, targets, indices, num_boxes):
+    def loss_polylines(self, outputs, targets, indices, num_polylines):
         idx = self._get_src_permutation_idx(indices)
         src_polylines = outputs['pred_polylines'][idx]
         target_polylines = torch.cat([t['polylines'][i] for t, (_, i) in zip(targets, indices)], dim=0)
         loss_polyline = F.l1_loss(src_polylines, target_polylines, reduction='none')
         losses = {}
-        losses['loss_polyline'] = loss_polyline.sum() / num_boxes
+        losses['loss_polyline'] = loss_polyline.sum() / num_polylines
         return losses
 
     def _get_src_permutation_idx(self, indices):
@@ -296,12 +306,12 @@ class SetCriterion(nn.Module):
 
     def forward(self, outputs, targets):
         indices = self.matcher(outputs, targets)
-        num_boxes = sum(len(t["labels"]) for t in targets)
-        num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
-        num_boxes = torch.clamp(num_boxes, min=1).item()
+        num_polylines = sum(len(t["labels"]) for t in targets)
+        num_polylines = torch.as_tensor([num_polylines], dtype=torch.float, device=next(iter(outputs.values())).device)
+        num_polylines = torch.clamp(num_polylines, min=1).item()
         losses = {}
-        losses.update(self.loss_labels(outputs, targets, indices, num_boxes))
-        losses.update(self.loss_polylines(outputs, targets, indices, num_boxes))
+        losses.update(self.loss_labels(outputs, targets, indices, num_polylines))
+        losses.update(self.loss_polylines(outputs, targets, indices, num_polylines))
         return losses
 
 
@@ -372,10 +382,13 @@ def collate_fn(batch):
 if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    dataset = VectorMapDataset("D:\\NF-VMap\\dataset\\train_grids", max_trips=5, max_lines=10, points_per_line=10)
-    dataloader = DataLoader(dataset, batch_size=8, shuffle=False, collate_fn=collate_fn)
+    save_dir = "checkpoints"  # 模型保存路径
+    os.makedirs(save_dir, exist_ok=True)
 
-    model = MapTransformer(max_trips=5, max_lines=10, points_per_line=10, num_queries=20, num_classes=3).to(device)
+    dataset = VectorMapDataset("D:\\NF-VMap\\dataset\\train_grids", max_trips=5, max_lines=10, points_per_line=10)
+    dataloader = DataLoader(dataset, batch_size=20, shuffle=True, collate_fn=collate_fn)
+
+    model = MapTransformer(max_trips=5, max_lines=10, points_per_line=10, num_queries=10, num_classes=3).to(device)
     matcher = HungarianMatcher(cost_class=1, cost_polyline=1)
     criterion = SetCriterion(num_classes=3, matcher=matcher, weight_dict={'loss_ce': 1, 'loss_polyline': 1})
     optimizer = optim.Adam(model.parameters(), lr=1e-4)
@@ -397,7 +410,7 @@ if __name__ == "__main__":
             label_classes = label_tensor[..., 2].long()  # 类别标签在最后一个维度
             label_coords = label_tensor[..., :2]  # 坐标在前两个维度
 
-            targets = [{'labels': label_classes[b].view(-1), 'polylines': label_coords[b].view(-1, 2)} for b in range(label_classes.size(0))]
+            targets = [{'labels': label_classes[b].t()[0], 'polylines': label_coords[b].view(-1, 10, 2)} for b in range(label_classes.size(0))]
             loss_dict = criterion(outputs, targets)
             loss = sum(loss_dict.values())
 
@@ -405,4 +418,9 @@ if __name__ == "__main__":
             loss.backward()
             optimizer.step()
 
+            print(f"Epoch {epoch + 1}, Loss: {loss_dict}")
             print(f"Epoch {epoch + 1}, Loss: {loss.item():.4f}")
+
+        # 每个epoch保存一次模型
+        torch.save(model.state_dict(), os.path.join(save_dir, f"model_epoch_{epoch + 1}.pth"))
+        print(f"Model saved to {os.path.join(save_dir, f'model_epoch_{epoch + 1}.pth')}")
