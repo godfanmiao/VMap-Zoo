@@ -8,6 +8,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from scipy.optimize import linear_sum_assignment
+import math
 
 # 数据集类
 class VectorMapDataset(Dataset):
@@ -48,8 +49,8 @@ class VectorMapDataset(Dataset):
                     break
                 points = line["points"]
                 normalized_points = self._normalize_coordinates(points, bounds["x_min"], bounds["x_max"], bounds["y_min"], bounds["y_max"])
-                resampled_points = self._resample_points(normalized_points, self.points_per_line)
-                input_tensor[trip_idx, line_idx, :, :2] = torch.tensor([[p['x'], p['y']] for p in resampled_points])
+                resampled_points = self._resample_polyline(normalized_points, self.points_per_line)
+                input_tensor[trip_idx, line_idx, :, :2] = torch.tensor([[p[0], p[1]] for p in resampled_points])
                 input_tensor[trip_idx, line_idx, :, 2] = line["class"]
                 for p_idx in range(self.points_per_line):
                     mask[trip_idx, line_idx, p_idx] = True
@@ -58,8 +59,8 @@ class VectorMapDataset(Dataset):
         for line_idx, line in enumerate(label_order_lines):  # 假设真值只有一趟
             points = line["points"]
             normalized_points = self._normalize_coordinates(points, bounds["x_min"], bounds["x_max"], bounds["y_min"], bounds["y_max"])
-            resampled_points = self._resample_points(normalized_points, self.points_per_line)
-            label_tensor[line_idx, :, :2] = torch.tensor([[p['x'], p['y']] for p in resampled_points])
+            resampled_points = self._resample_polyline(normalized_points, self.points_per_line)
+            label_tensor[line_idx, :, :2] = torch.tensor([[p[0], p[1]] for p in resampled_points])
             label_tensor[line_idx, :, 2] = line["class"]
 
         return {
@@ -111,18 +112,18 @@ class VectorMapDataset(Dataset):
                 vec_orders[current_order_id]["order_id"] = current_order_id
             elif line.startswith("LINESTRING"):
                 points_str = re.findall(r"\((.*?)\)", line)[0]
-                points = [{"x": float(coord.split()[0]), "y": float(coord.split()[1])} for coord in points_str.split(", ")]
+                points = [(float(coord.split()[0]), float(coord.split()[1])) for coord in points_str.split(", ")]
                 vec_orders[current_order_id]["lines"].append({"points": points, "class": 0})
 
         # 解析label文件
-        label_order_lines = vec_orders[current_order_id]["lines"]
-        # label_order_lines = []
-        # for line in label_lines:
-        #     line = line.strip()
-        #     if line.startswith("LINESTRING"):
-        #         points_str = re.findall(r"\((.*?)\)", line)[0]
-        #         points = [{"x": float(coord.split()[0]), "y": float(coord.split()[1])} for coord in points_str.split(", ")]
-        #         label_order_lines.append({"points": points, "class": 0})
+        # label_order_lines = vec_orders[current_order_id]["lines"]
+        label_order_lines = []
+        for line in label_lines:
+            line = line.strip()
+            if line.startswith("LINESTRING"):
+                points_str = re.findall(r"\((.*?)\)", line)[0]
+                points = [(float(coord.split()[0]), float(coord.split()[1])) for coord in points_str.split(", ")]
+                label_order_lines.append({"points": points, "class": 0})
 
         return {
             "vec_orders": vec_orders, 
@@ -133,7 +134,7 @@ class VectorMapDataset(Dataset):
     def _normalize_coordinates(self, points, x_min, x_max, y_min, y_max):
         """
         对坐标点进行归一化处理。
-        :param points: 点列表，每个点为 {'x': float, 'y': float}
+        :param points: 点列表，格式为 [(x1, y1), (x2, y2), ...]
         :param x_min: x坐标的最小值
         :param x_max: x坐标的最大值
         :param y_min: y坐标的最小值
@@ -142,20 +143,86 @@ class VectorMapDataset(Dataset):
         """
         normalized_points = []
         for point in points:
-            x = (point['x'] - x_min) / (x_max - x_min)
-            y = (point['y'] - y_min) / (y_max - y_min)
-            normalized_points.append({'x': x, 'y': y})
+            x = (point[0] - x_min) / (x_max - x_min)
+            y = (point[1] - y_min) / (y_max - y_min)
+            normalized_points.append((x, y))
         return normalized_points
 
-    def _resample_points(self, points, num_points):
-        if len(points) > num_points:
-            # 如果点数过多，均匀采样
-            indices = torch.linspace(0, len(points) - 1, num_points).long()
-            resampled_points = [points[i] for i in indices]
-        else:
-            # 如果点数不足，重复填充
-            resampled_points = points * (num_points // len(points)) + points[:num_points % len(points)]
-        return resampled_points
+    def _compute_length(self, point1, point2):
+        """计算两点之间的欧几里得距离"""
+        return math.hypot(point2[0] - point1[0], point2[1] - point1[1])
+
+    def _calculate_total_length(self, polylines):
+        """计算折线的总长度"""
+        total_length = 0.0
+        for i in range(len(polylines) - 1):
+            total_length += self._compute_length(polylines[i], polylines[i+1])
+        return total_length
+
+    def _resample_polyline(self, polylines, num_points):
+        """
+        对折线进行重采样，使其包含固定数量的点
+        :param polylines: 原始折线的点列表，格式为 [(x1, y1), (x2, y2), ...]
+        :param num_points: 需要重采样成的点数
+        :return: 重采样后的点列表
+        """
+        if len(polylines) < 2:
+            raise ValueError("折线至少需要两个点才能重采样")
+        
+        # 计算折线的总长度
+        total_length = self._calculate_total_length(polylines)
+        if total_length == 0:
+            return polylines  # 如果总长度为0，返回原点
+        
+        # 计算目标点间距
+        segment_length = total_length / (num_points - 1)
+        sampled_points = []
+        current_point = 0  # 当前到达的点索引
+        current_length = 0.0  # 累计距离
+        
+        sampled_points.append(polylines[0])  # 添加起点
+        
+        # 遍历每条线段，按等间距采样
+        for i in range(len(polylines) - 1):
+            a = polylines[i]
+            b = polylines[i+1]
+            segment_length_ab = self._compute_length(a, b)
+            if segment_length_ab == 0:
+                continue  # 忽略重合点，避免除以零
+            
+            # 计算该线段需要插入的点
+            t = 0.0  # 线段上的参数，范围 [0, 1]
+            while t <= 1.0:
+                # 当前位置
+                x = a[0] + (b[0] - a[0]) * t
+                y = a[1] + (b[1] - a[1]) * t
+                point = (x, y)
+                
+                # 计算当前点到起点的总距离
+                current_distance = self._compute_length(polylines[0], point)
+                
+                # 判断是否需要添加这个点
+                if len(sampled_points) < num_points:
+                    if current_distance >= segment_length * len(sampled_points):
+                        sampled_points.append(point)
+                
+                # 更新 t，继续沿着线段前进
+                t += segment_length / segment_length_ab
+            
+            # 跳出循环时，可能最后一点需要额外处理
+            current_distance = self._compute_length(polylines[0], b)
+            if len(sampled_points) < num_points:
+                if current_distance >= segment_length * len(sampled_points):
+                    sampled_points.append(b)
+        
+        # 确保最后一个点被添加
+        if len(sampled_points) < num_points:
+            sampled_points.append(polylines[-1])
+        
+        # 截取前 num_points 个点
+        sampled_points = sampled_points[:num_points]
+        
+        return sampled_points
 
 
 # Transformer模型
@@ -233,7 +300,7 @@ class HungarianMatcher(nn.Module):
             polyline2 = polyline2.unsqueeze(0)  # 将形状从 [2] 转换为 [1, 2]
 
         # 计算点到点的距离矩阵
-        dist_matrix = torch.cdist(polyline1.view(-1, 2), polyline2.view(-1, 2), p=1)  # Shape: [num_points1, num_points2]
+        dist_matrix = torch.cdist(polyline1, polyline2, p=1)  # Shape: [num_points1, num_points2]
 
         # 计算 polyline1 到 polyline2 的最小距离
         min_dist1 = dist_matrix.min(dim=1).values.mean()
@@ -314,24 +381,6 @@ class SetCriterion(nn.Module):
         losses.update(self.loss_polylines(outputs, targets, indices, num_polylines))
         return losses
 
-
-def normalize_coordinates(points, x_min, x_max, y_min, y_max):
-    """
-    对坐标点进行归一化处理。
-    :param points: 点列表，每个点为 {'x': float, 'y': float}
-    :param x_min: x坐标的最小值
-    :param x_max: x坐标的最大值
-    :param y_min: y坐标的最小值
-    :param y_max: y坐标的最大值
-    :return: 归一化后的点列表
-    """
-    normalized_points = []
-    for point in points:
-        x = (point['x'] - x_min) / (x_max - x_min)
-        y = (point['y'] - y_min) / (y_max - y_min)
-        normalized_points.append({'x': x, 'y': y})
-    return normalized_points
-
 def collate_fn(batch):
     """
     自定义collate_fn，用于处理不同长度的label_tensor。
@@ -393,13 +442,13 @@ if __name__ == "__main__":
 
     train_dataset = VectorMapDataset("/Users/liubao/Downloads/NF-VMap/dataset/train", max_trips, max_lines, points_per_line)
     val_dataset = VectorMapDataset("/Users/liubao/Downloads/NF-VMap/dataset/val", max_trips, max_lines, points_per_line)
-    train_dataloader = DataLoader(train_dataset, batch_size=20, shuffle=True, collate_fn=collate_fn)
-    val_dataloader = DataLoader(val_dataset, batch_size=5, shuffle=False, collate_fn=collate_fn)
+    train_dataloader = DataLoader(train_dataset, batch_size=2, shuffle=True, collate_fn=collate_fn)
+    val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
 
-    model = MapTransformer(max_trips=max_trips, max_lines=max_lines, points_per_line=10, num_queries=20, num_classes=3).to(device)
+    model = MapTransformer(max_trips=max_trips, max_lines=max_lines, points_per_line=points_per_line, num_queries=10, num_classes=3).to(device)
     matcher = HungarianMatcher(cost_class=1, cost_polyline=1)
     criterion = SetCriterion(num_classes=3, matcher=matcher, weight_dict={'loss_ce': 1, 'loss_polyline': 1})
-    optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=5e-5)
 
     for epoch in range(total_epochs):
