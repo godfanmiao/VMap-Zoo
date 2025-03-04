@@ -9,6 +9,8 @@ from torch.utils.data import Dataset, DataLoader
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 import math
+from torch.utils.tensorboard import SummaryWriter
+import time
 
 # 数据集类
 class VectorMapDataset(Dataset):
@@ -38,7 +40,7 @@ class VectorMapDataset(Dataset):
         # 初始化输入张量和掩码矩阵
         input_tensor = torch.zeros((self.max_trips, self.max_lines, self.points_per_line, 3))
         label_tensor = torch.zeros((len(label_order_lines), self.points_per_line, 3))  # 真值认为是一趟，所以是(len(label_orders), N, 3)
-        mask = torch.zeros((self.max_trips, self.max_lines, self.points_per_line), dtype=torch.bool)
+        mask = torch.zeros((self.max_trips, self.max_lines), dtype=torch.bool)
 
         # 处理原始矢量数据
         for trip_idx, order in enumerate(vec_orders.values()):
@@ -52,8 +54,7 @@ class VectorMapDataset(Dataset):
                 resampled_points = self._resample_polyline(normalized_points, self.points_per_line)
                 input_tensor[trip_idx, line_idx, :, :2] = torch.tensor([[p[0], p[1]] for p in resampled_points])
                 input_tensor[trip_idx, line_idx, :, 2] = line["class"]
-                for p_idx in range(self.points_per_line):
-                    mask[trip_idx, line_idx, p_idx] = True
+                mask[trip_idx, line_idx] = True
 
         # 处理真值矢量数据
         for line_idx, line in enumerate(label_order_lines):  # 假设真值只有一趟
@@ -63,12 +64,29 @@ class VectorMapDataset(Dataset):
             label_tensor[line_idx, :, :2] = torch.tensor([[p[0], p[1]] for p in resampled_points])
             label_tensor[line_idx, :, 2] = line["class"]
 
+        
+        # 将输入数据的一趟重复多次，并作为真值
+        # input_tensor = self._replace_with_first_element(input_tensor, dim=0)
+        # mask = self._replace_with_first_element(mask, dim=0)
+        # label_tensor = input_tensor[0]
+
         return {
             "input_tensor": input_tensor,  # 输入张量
             "label_tensor": label_tensor,  # 真值张量
             "mask": mask,  # 掩码矩阵
             "bounds": bounds  # Bounds范围（可选，用于调试或反归一化）
         }
+    
+    def _replace_with_first_element(self, tensor, dim=0):
+        # 获取第一个元素
+        first_element = tensor[0]
+        # 计算需要的重复次数（沿着指定维度）
+        repeats = [tensor.shape[dim]] + [1] * (tensor.ndim - 1)
+        # 使用 tile 复制第一个元素到整个维度
+        repeated_element = first_element.tile(*repeats)
+        # 替换原 tensor 的值
+        tensor = repeated_element
+        return tensor
 
     def _load_data_from_folders(self):
         maps = []
@@ -116,7 +134,6 @@ class VectorMapDataset(Dataset):
                 vec_orders[current_order_id]["lines"].append({"points": points, "class": 0})
 
         # 解析label文件
-        # label_order_lines = vec_orders[current_order_id]["lines"]
         label_order_lines = []
         for line in label_lines:
             line = line.strip()
@@ -224,6 +241,19 @@ class VectorMapDataset(Dataset):
         
         return sampled_points
 
+class MLP(nn.Module):
+    """ Very simple multi-layer perceptron (also called FFN)"""
+
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
+        return x
 
 # Transformer模型
 class MapTransformer(nn.Module):
@@ -236,7 +266,7 @@ class MapTransformer(nn.Module):
         self.points_per_line = points_per_line
 
         # 嵌入层
-        self.input_proj = nn.Linear(2, hidden_dim)  # 输入特征维度为2 (x, y)
+        self.input_proj = nn.Linear(2 * points_per_line, hidden_dim)  # 输入特征维度为2 * points_per_line (x, y)
         self.class_embed = nn.Embedding(num_classes, hidden_dim)
         # 条件层
         self.conditional_layer = nn.Linear(hidden_dim, hidden_dim)
@@ -244,47 +274,69 @@ class MapTransformer(nn.Module):
         # Transformer
         self.transformer = nn.Transformer(d_model=hidden_dim, nhead=num_heads,
                                           num_encoder_layers=num_encoder_layers,
-                                          num_decoder_layers=num_decoder_layers)
+                                          num_decoder_layers=num_decoder_layers,
+                                          batch_first=True)
 
         # 查询嵌入
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
 
         # 输出层
         self.class_head = nn.Linear(hidden_dim, (num_classes + 1))
-        self.polyline_head = nn.Linear(hidden_dim, points_per_line * 2)  # 输出坐标
+        # self.polyline_head = nn.Linear(hidden_dim, points_per_line * 2)  # 输出坐标
+        self.polyline_head = MLP(hidden_dim, hidden_dim, points_per_line * 2, 3)
+
+        self.trip_embed = nn.Parameter(torch.rand(50, hidden_dim // 2))  # 每个trip的嵌入
+        self.line_embed = nn.Parameter(torch.rand(50, hidden_dim // 2))
+
+
+        # 自定义初始化
+        # 初始化权重
+        # nn.init.kaiming_normal_(self.input_proj.weight, mode='fan_in', nonlinearity='relu')
+        # nn.init.constant_(self.input_proj.bias, 0)
+
+        # nn.init.kaiming_normal_(self.conditional_layer.weight, mode='fan_in', nonlinearity='relu')
+        # nn.init.constant_(self.conditional_layer.bias, 0)
+
+        # nn.init.xavier_normal_(self.class_embed.weight)
+        # nn.init.xavier_normal_(self.query_embed.weight)
 
     def forward(self, input_tensor, mask):
         # 输入张量形状：[B, M, L_max, N, 3]
         B, M, L_max, N, _ = input_tensor.shape
 
         # 展平输入张量以适应Transformer
-        input_tensor = input_tensor.view(B, M * L_max * N, 3)  # [B, M * L_max * N, 3]
-        mask = mask.view(B, M * L_max * N)  # [B, M * L_max * N]
+        mask = mask.view(B, M * L_max)  # [B, M * L_max]
 
         # 嵌入
-        coord_embed = self.input_proj(input_tensor[..., :2])  # [B, M * L_max * N, hidden_dim]
-        class_embed = self.class_embed(input_tensor[..., 2].long())  # [B, M * L_max * N, hidden_dim]
+        coord_embed = self.input_proj(input_tensor[..., :2].reshape(B, M * L_max, N * 2))  # [B, M * L_max, hidden_dim]
+        class_embed = self.class_embed(input_tensor[..., 2].view(B, M * L_max, N)[..., 0].long())  # [B, M * L_max, hidden_dim]
         # 条件调整
-        conditional_embed = self.conditional_layer(class_embed)  # [N, hidden_dim]
-        combined_embed = coord_embed + conditional_embed  # [B, M * L_max * N, hidden_dim]
+        conditional_embed = self.conditional_layer(class_embed)  # [B, M * L_max, hidden_dim]
+        combined_embed = coord_embed + conditional_embed  # [B, M * L_max, hidden_dim]
+
+        pos = torch.cat([
+            self.trip_embed[:M].unsqueeze(0).repeat(L_max, 1, 1),
+            self.line_embed[:L_max].unsqueeze(1).repeat(1, M, 1)
+        ], dim=-1).flatten(0, 1).unsqueeze(0).repeat(B, 1, 1)  # [B, M * L_max, hidden_dim]
 
         # Transformer 输入
-        src = combined_embed.permute(1, 0, 2)  # [seq_len, batch_size, hidden_dim]
-        tgt = self.query_embed.weight.unsqueeze(1).repeat(1, B, 1)  # [num_queries, batch_size, hidden_dim]
-        hs = self.transformer(src, tgt, src_key_padding_mask=mask)  # Transformer 输出
+        src = combined_embed  # [B, M * L_max, hidden_dim]
+        tgt = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)  # [batch_size, num_queries, hidden_dim]
+        hs = self.transformer(pos + src, tgt, src_key_padding_mask=mask)  # Transformer 输出
 
         # 输出预测
-        outputs_class = self.class_head(hs)  # [num_queries, B, (num_classes + 1)]
-        outputs_polylines = self.polyline_head(hs).sigmoid().view(self.num_queries, B, self.points_per_line, 2)  # [num_queries, B, N, 2]
+        outputs_class = self.class_head(hs)  # [B, num_queries, (num_classes + 1)]
+        outputs_polylines = self.polyline_head(hs).sigmoid()  # [B, num_queries, N, 2]
 
         return outputs_class, outputs_polylines
 
 # 匈牙利匹配器
 class HungarianMatcher(nn.Module):
-    def __init__(self, cost_class=1, cost_polyline=1):
+    def __init__(self, cost_class=1, cost_polyline=1, cost_direction=1):
         super(HungarianMatcher, self).__init__()
         self.cost_class = cost_class
         self.cost_polyline = cost_polyline
+        self.cost_direction = cost_direction
 
     def polyline_distance(self, polyline1, polyline2):
         """
@@ -310,9 +362,66 @@ class HungarianMatcher(nn.Module):
         # 返回两条 polyline 之间的平均距离
         return (min_dist1 + min_dist2) / 2
 
+    def discrete_frechet_distance(self, polyline1, polyline2):
+        """
+        Compute the discrete Fréchet distance between two polylines using dynamic programming.
+        :param polyline1: Tensor of shape [num_points1, 2] representing the first polyline.
+        :param polyline2: Tensor of shape [num_points2, 2] representing the second polyline.
+        :return: Discrete Fréchet distance between the two polylines.
+        """
+        # 确保输入是二维张量
+        if polyline1.dim() == 1:
+            polyline1 = polyline1.unsqueeze(0)
+        if polyline2.dim() == 1:
+            polyline2 = polyline2.unsqueeze(0)
+
+        m = polyline1.size(0)
+        n = polyline2.size(0)
+
+        # 初始化动态规划表
+        dp = torch.zeros(m, n, dtype=torch.float32)
+
+        # 定义欧几里得距离函数
+        def distance(i, j):
+            return torch.norm(polyline1[i] - polyline2[j], p=2)
+
+        # 填充动态规划表
+        for i in range(m):
+            for j in range(n):
+                if i == 0 and j == 0:
+                    dp[i][j] = distance(i, j)
+                elif i == 0:
+                    dp[i][j] = torch.max(dp[i][j - 1], distance(i, j))
+                elif j == 0:
+                    dp[i][j] = torch.max(dp[i - 1][j], distance(i, j))
+                else:
+                    candidate = torch.min(torch.stack([dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]]))
+                    dp[i][j] = torch.max(candidate, distance(i, j))
+
+        return dp[-1][-1].item()
+    
+    def direction_loss(self, pred_polyline, gt_polyline):
+        """
+        Compute the direction loss between two polylines.
+        :param pred_polyline: Predicted polyline tensor of shape [N, 2]
+        :param gt_polyline: Ground truth polyline tensor of shape [N, 2]
+        :return: Direction loss
+        """
+        # 计算首尾点的方向向量
+        pred_direction = pred_polyline[-1] - pred_polyline[0]
+        gt_direction = gt_polyline[-1] - gt_polyline[0]
+
+        # 归一化方向向量
+        pred_direction = pred_direction / (torch.norm(pred_direction) + 1e-6)
+        gt_direction = gt_direction / (torch.norm(gt_direction) + 1e-6)
+
+        # 计算方向损失（余弦相似度）
+        cosine_similarity = torch.dot(pred_direction, gt_direction)
+        return 1 - cosine_similarity
+
     def forward(self, outputs, targets):
         with torch.no_grad():
-            num_queries, bs = outputs["pred_logits"].shape[:2]
+            bs, num_queries = outputs["pred_logits"].shape[:2]
             out_prob = outputs["pred_logits"].flatten(0, 1).softmax(-1)  # [batch_size * num_queries, (num_classes + 1)]
             out_polylines = outputs["pred_polylines"].flatten(0, 1)  # [batch_size * num_queries, max_points, 2]
 
@@ -328,8 +437,14 @@ class HungarianMatcher(nn.Module):
                 for j, tgt_poly in enumerate(tgt_polylines):
                     cost_polyline[i, j] = self.polyline_distance(pred_poly, tgt_poly)
 
+            # 方向成本
+            cost_direction = torch.zeros_like(cost_class)
+            for i, pred_poly in enumerate(out_polylines):
+                for j, tgt_poly in enumerate(tgt_polylines):
+                    cost_direction[i, j] = self.direction_loss(pred_poly, tgt_poly)
+            
             # 综合成本
-            C = self.cost_class * cost_class + self.cost_polyline * cost_polyline
+            C = self.cost_class * cost_class + self.cost_polyline * cost_polyline + self.cost_direction * cost_direction
             C = C.view(bs, num_queries, -1).cpu()
 
             # 匈牙利匹配
@@ -361,15 +476,53 @@ class SetCriterion(nn.Module):
         idx = self._get_src_permutation_idx(indices)
         src_polylines = outputs['pred_polylines'][idx]
         target_polylines = torch.cat([t['polylines'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-        loss_polyline = F.l1_loss(src_polylines, target_polylines, reduction='none')
-        losses = {}
-        losses['loss_polyline'] = loss_polyline.sum() / num_polylines
+        # 方向损失计算
+        polyline_loss = 0.0
+        for polyline1, polyline2 in zip(src_polylines, target_polylines):
+            # 确保 polyline1 和 polyline2 的形状至少为 [1, 2]
+            if polyline1.dim() == 1:
+                polyline1 = polyline1.unsqueeze(0)  # 将形状从 [2] 转换为 [1, 2]
+            if polyline2.dim() == 1:
+                polyline2 = polyline2.unsqueeze(0)  # 将形状从 [2] 转换为 [1, 2]
+
+            # 计算点到点的距离矩阵
+            dist_matrix = torch.cdist(polyline1, polyline2, p=1)  # Shape: [num_points1, num_points2]
+
+            # 计算 polyline1 到 polyline2 的最小距离
+            min_dist1 = dist_matrix.min(dim=1).values.mean()
+            # 计算 polyline2 到 polyline1 的最小距离
+            min_dist2 = dist_matrix.min(dim=0).values.mean()
+
+            # 两条 polyline 之间的平均距离
+            polyline_loss += 1 - (min_dist1 + min_dist2) / 2
+        polyline_loss /= num_polylines
+        losses = {'loss_polyline': polyline_loss}
+        return losses
+        
+    def loss_direction(self, outputs, targets, indices, num_polylines):
+        idx = self._get_src_permutation_idx(indices)
+        src_polylines = outputs['pred_polylines'][idx]
+        target_polylines = torch.cat([t['polylines'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        # 方向损失计算
+        direction_loss = 0.0
+        for src, tgt in zip(src_polylines, target_polylines):
+            # 计算方向向量
+            src_diff = src[-1] - src[0]
+            tgt_diff = tgt[-1] - tgt[0]
+            # 归一化
+            src_diff = src_diff / (torch.norm(src_diff) + 1e-6)
+            tgt_diff = tgt_diff / (torch.norm(tgt_diff) + 1e-6)
+            # 余弦相似度
+            cosine_similarity = torch.dot(src_diff, tgt_diff)
+            direction_loss += 1 - cosine_similarity
+        direction_loss /= num_polylines
+        losses = {'loss_direction': direction_loss}
         return losses
 
     def _get_src_permutation_idx(self, indices):
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         src_idx = torch.cat([src for (src, _) in indices])
-        return src_idx, batch_idx
+        return batch_idx, src_idx
 
     def forward(self, outputs, targets):
         indices = self.matcher(outputs, targets)
@@ -379,6 +532,7 @@ class SetCriterion(nn.Module):
         losses = {}
         losses.update(self.loss_labels(outputs, targets, indices, num_polylines))
         losses.update(self.loss_polylines(outputs, targets, indices, num_polylines))
+        losses.update(self.loss_direction(outputs, targets, indices, num_polylines))
         return losses
 
 def collate_fn(batch):
@@ -434,52 +588,76 @@ if __name__ == "__main__":
     save_dir = "checkpoints"  # 模型保存路径
     os.makedirs(save_dir, exist_ok=True)
 
-    total_epochs = 100  # 总训练轮数
+    run_dir = "runs"  # TensorBoard 日志保存路径
+    version = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
+    log_dir = os.path.join(run_dir, f"logs-{version}")  # TensorBoard 日志保存路径
+    writer = SummaryWriter(log_dir=log_dir)  # 初始化 TensorBoard SummaryWriter
 
+    total_epochs = 500  # 总训练轮数
+    save_interval = 10  # 每多少轮保存一次模型
+    train_batch_size = 8  # 训练批次大小
+    val_batch_size = 2  # 验证批次大小
+
+    num_queries = 5  # 每个样本的查询次数
     max_trips = 5  # 每个样本的最大趟数
     max_lines = 10  # 每趟的最大线段数
     points_per_line = 10  # 每条线段的最大点数
 
-    train_dataset = VectorMapDataset("/Users/liubao/Downloads/NF-VMap/dataset/train", max_trips, max_lines, points_per_line)
-    val_dataset = VectorMapDataset("/Users/liubao/Downloads/NF-VMap/dataset/val", max_trips, max_lines, points_per_line)
-    train_dataloader = DataLoader(train_dataset, batch_size=2, shuffle=True, collate_fn=collate_fn)
-    val_dataloader = DataLoader(val_dataset, batch_size=1, shuffle=False, collate_fn=collate_fn)
+    train_dataset = VectorMapDataset("D:/NF-VMap/dataset/train", max_trips, max_lines, points_per_line)
+    val_dataset = VectorMapDataset("D:/NF-VMap/dataset/val", max_trips, max_lines, points_per_line)
+    train_dataloader = DataLoader(train_dataset, batch_size=train_batch_size, shuffle=True, collate_fn=collate_fn, drop_last=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=val_batch_size, shuffle=False, collate_fn=collate_fn, drop_last=True)
 
-    model = MapTransformer(max_trips=max_trips, max_lines=max_lines, points_per_line=points_per_line, num_queries=10, num_classes=3).to(device)
+    model = MapTransformer(max_trips=max_trips, max_lines=max_lines, points_per_line=points_per_line, num_queries=num_queries, num_classes=3).to(device)
     matcher = HungarianMatcher(cost_class=1, cost_polyline=1)
-    criterion = SetCriterion(num_classes=3, matcher=matcher, weight_dict={'loss_ce': 1, 'loss_polyline': 1})
+    criterion = SetCriterion(num_classes=3, matcher=matcher, weight_dict={'loss_ce': 1, 'loss_polyline': 3, 'loss_direction': 1})
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-5)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=5e-5)
 
     for epoch in range(total_epochs):
         model.train()
+        train_loss = 0.0
         for batch in train_dataloader:
             input_tensor = batch['input_tensor'].to(device)
             label_tensor = batch['label_tensor'].to(device)
             mask = batch['mask'].to(device)
+            label_mask = batch['label_mask'].to(device)
 
             outputs_class, outputs_coords = model(input_tensor, mask)
             outputs = {
                 'pred_logits': outputs_class,
-                'pred_polylines': outputs_coords
+                'pred_polylines': outputs_coords.view(train_batch_size, num_queries, points_per_line, 2)
             }
 
             # 提取类别标签和坐标
             label_classes = label_tensor[..., 2].long()  # 类别标签在最后一个维度
             label_coords = label_tensor[..., :2]  # 坐标在前两个维度
 
-            targets = [{'labels': label_classes[b].t()[0], 'polylines': label_coords[b].view(-1, 10, 2)} for b in range(label_classes.size(0))]
+            targets = [{
+                'labels': label_classes[b].t()[0][label_mask[b]], 
+                'polylines': label_coords[b].view(-1, 10, 2)[label_mask[b]]
+            } for b in range(label_classes.size(0))]
             loss_dict = criterion(outputs, targets)
+            print(f"Loss: CE={loss_dict['loss_ce']:.4f}, Polyline={loss_dict['loss_polyline']:.4f}, Direction={loss_dict['loss_direction']:.4f}")
             loss = sum(loss_dict.values())
+            train_loss += loss.item()
 
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            print(f"Epoch {epoch + 1}, Loss: {loss_dict}")
-            print(f"Epoch {epoch + 1}, Loss: {loss.item():.4f}")
-        scheduler.step()
+            # print(f"Epoch {epoch + 1}, Loss: {loss_dict}")
+            # print(f"Epoch {epoch + 1}, Loss: {loss.item():.4f}")
+        
+        train_loss /= len(train_dataloader)
         print(f"Epoch {epoch + 1}, Learning Rate: {scheduler.get_last_lr()}")
+        print(f"Epoch {epoch + 1}, Train Loss: {train_loss:.4f}")
+
+        # 计算平均训练损失
+        writer.add_scalar('Loss/train', train_loss, epoch + 1)
+        # 记录学习率
+        current_lr = optimizer.param_groups[0]['lr']
+        writer.add_scalar('Learning Rate', current_lr, epoch + 1)
 
         # 验证阶段
         model.eval()
@@ -489,25 +667,36 @@ if __name__ == "__main__":
                 input_tensor = batch['input_tensor'].to(device)
                 label_tensor = batch['label_tensor'].to(device)
                 mask = batch['mask'].to(device)
+                label_mask = batch['label_mask'].to(device)
 
                 outputs_class, outputs_coords = model(input_tensor, mask)
                 outputs = {
                     'pred_logits': outputs_class,
-                    'pred_polylines': outputs_coords
+                    'pred_polylines': outputs_coords.view(val_batch_size, num_queries, points_per_line, 2)
                 }
 
                 label_classes = label_tensor[..., 2].long()
                 label_coords = label_tensor[..., :2]
 
-                targets = [{'labels': label_classes[b].t()[0], 'polylines': label_coords[b].view(-1, 10, 2)} for b in range(label_classes.size(0))]
+                targets = [{
+                    'labels': label_classes[b].t()[0][label_mask[b]], 
+                    'polylines': label_coords[b].view(-1, 10, 2)[label_mask[b]]
+                } for b in range(label_classes.size(0))]
                 loss_dict = criterion(outputs, targets)
+                print(f"Loss: CE={loss_dict['loss_ce']:.4f}, Polyline={loss_dict['loss_polyline']:.4f}, Direction={loss_dict['loss_direction']:.4f}")
                 loss = sum(loss_dict.values())
                 val_loss += loss.item()
 
         val_loss /= len(val_dataloader)
         print(f"Epoch {epoch + 1}, Val Loss: {val_loss:.4f}")
+        writer.add_scalar('Loss/validation', val_loss, epoch + 1)
 
+        scheduler.step()
 
-        # 每个epoch保存一次模型
-        torch.save(model.state_dict(), os.path.join(save_dir, f"model_epoch_{epoch + 1}.pth"))
-        print(f"Model saved to {os.path.join(save_dir, f'model_epoch_{epoch + 1}.pth')}")
+        if (epoch + 1) % save_interval == 0:
+            # 每个epoch保存一次模型
+            torch.save(model.state_dict(), os.path.join(save_dir, f"model_epoch_{epoch + 1}.pth"))
+            print(f"Model saved to {os.path.join(save_dir, f'model_epoch_{epoch + 1}.pth')}")
+
+    # 关闭 TensorBoard writer
+    writer.close()
