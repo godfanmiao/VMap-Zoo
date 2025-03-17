@@ -40,7 +40,7 @@ class VectorMapDataset(Dataset):
         # 初始化输入张量和掩码矩阵
         input_tensor = torch.zeros((self.max_trips, self.max_lines, self.points_per_line, 3))
         label_tensor = torch.zeros((len(label_order_lines), self.points_per_line, 3))  # 真值认为是一趟，所以是(len(label_orders), N, 3)
-        mask = torch.zeros((self.max_trips, self.max_lines), dtype=torch.bool)
+        input_mask = torch.ones((self.max_trips, self.max_lines), dtype=torch.bool)
 
         # 处理原始矢量数据
         for trip_idx, order in enumerate(vec_orders.values()):
@@ -54,7 +54,7 @@ class VectorMapDataset(Dataset):
                 resampled_points = self._resample_polyline(normalized_points, self.points_per_line)
                 input_tensor[trip_idx, line_idx, :, :2] = torch.tensor([[p[0], p[1]] for p in resampled_points])
                 input_tensor[trip_idx, line_idx, :, 2] = line["class"]
-                mask[trip_idx, line_idx] = True
+                input_mask[trip_idx, line_idx] = False
 
         # 处理真值矢量数据
         for line_idx, line in enumerate(label_order_lines):  # 假设真值只有一趟
@@ -67,13 +67,13 @@ class VectorMapDataset(Dataset):
         
         # 将输入数据的一趟重复多次，并作为真值
         # input_tensor = self._replace_with_first_element(input_tensor, dim=0)
-        # mask = self._replace_with_first_element(mask, dim=0)
+        # input_mask = self._replace_with_first_element(input_mask, dim=0)
         # label_tensor = input_tensor[0]
 
         return {
             "input_tensor": input_tensor,  # 输入张量
             "label_tensor": label_tensor,  # 真值张量
-            "mask": mask,  # 掩码矩阵
+            "input_mask": input_mask,  # 掩码矩阵
             "bounds": bounds  # Bounds范围（可选，用于调试或反归一化）
         }
     
@@ -266,7 +266,7 @@ class MapTransformer(nn.Module):
         self.points_per_line = points_per_line
 
         # 嵌入层
-        self.input_proj = nn.Linear(2 * points_per_line, hidden_dim)  # 输入特征维度为2 * points_per_line (x, y)
+        self.input_proj = MLP(2 * points_per_line, hidden_dim, hidden_dim, 3)  # 输入特征维度为2 * points_per_line (x, y)
         self.class_embed = nn.Embedding(num_classes, hidden_dim)
         # 条件层
         self.conditional_layer = nn.Linear(hidden_dim, hidden_dim)
@@ -544,7 +544,7 @@ def collate_fn(batch):
     # 提取每个样本的输入张量、标签张量、掩码矩阵和Bounds
     input_tensors = [item["input_tensor"] for item in batch]
     label_tensors = [item["label_tensor"] for item in batch]
-    masks = [item["mask"] for item in batch]
+    input_masks = [item["input_mask"] for item in batch]
     bounds = [item["bounds"] for item in batch]
 
     # 计算每个样本的标签数量
@@ -564,19 +564,19 @@ def collate_fn(batch):
 
         # 创建掩码矩阵
         label_mask = torch.zeros(max_label_length, dtype=torch.bool)
-        label_mask[:length] = True
+        label_mask[:length] = False
         label_masks.append(label_mask)
 
     # 将输入张量堆叠成一个批次
     input_tensors = torch.stack(input_tensors, dim=0)
-    masks = torch.stack(masks, dim=0)
+    input_masks = torch.stack(input_masks, dim=0)
     label_masks = torch.stack(label_masks, dim=0)
     padded_label_tensors = torch.stack(padded_label_tensors, dim=0)
 
     return {
         "input_tensor": input_tensors,
         "label_tensor": padded_label_tensors,
-        "mask": masks,
+        "input_mask": input_masks,
         "label_mask": label_masks,
         "bounds": bounds
     }
@@ -620,10 +620,10 @@ if __name__ == "__main__":
         for batch in train_dataloader:
             input_tensor = batch['input_tensor'].to(device)
             label_tensor = batch['label_tensor'].to(device)
-            mask = batch['mask'].to(device)
+            input_mask = batch['input_mask'].to(device)
             label_mask = batch['label_mask'].to(device)
 
-            outputs_class, outputs_coords = model(input_tensor, mask)
+            outputs_class, outputs_coords = model(input_tensor, input_mask)
             outputs = {
                 'pred_logits': outputs_class,
                 'pred_polylines': outputs_coords.view(train_batch_size, num_queries, points_per_line, 2)
@@ -634,8 +634,8 @@ if __name__ == "__main__":
             label_coords = label_tensor[..., :2]  # 坐标在前两个维度
 
             targets = [{
-                'labels': label_classes[b].t()[0][label_mask[b]], 
-                'polylines': label_coords[b].view(-1, 10, 2)[label_mask[b]]
+                'labels': label_classes[b].t()[0][~label_mask[b]], 
+                'polylines': label_coords[b].view(-1, 10, 2)[~label_mask[b]]
             } for b in range(label_classes.size(0))]
             loss_dict = criterion(outputs, targets)
             print(f"Loss: CE={loss_dict['loss_ce']:.4f}, Polyline={loss_dict['loss_polyline']:.4f}, Direction={loss_dict['loss_direction']:.4f}")
@@ -666,10 +666,10 @@ if __name__ == "__main__":
             for batch in val_dataloader:
                 input_tensor = batch['input_tensor'].to(device)
                 label_tensor = batch['label_tensor'].to(device)
-                mask = batch['mask'].to(device)
+                input_mask = batch['input_mask'].to(device)
                 label_mask = batch['label_mask'].to(device)
 
-                outputs_class, outputs_coords = model(input_tensor, mask)
+                outputs_class, outputs_coords = model(input_tensor, input_mask)
                 outputs = {
                     'pred_logits': outputs_class,
                     'pred_polylines': outputs_coords.view(val_batch_size, num_queries, points_per_line, 2)
@@ -679,8 +679,8 @@ if __name__ == "__main__":
                 label_coords = label_tensor[..., :2]
 
                 targets = [{
-                    'labels': label_classes[b].t()[0][label_mask[b]], 
-                    'polylines': label_coords[b].view(-1, 10, 2)[label_mask[b]]
+                    'labels': label_classes[b].t()[0][~label_mask[b]], 
+                    'polylines': label_coords[b].view(-1, 10, 2)[~label_mask[b]]
                 } for b in range(label_classes.size(0))]
                 loss_dict = criterion(outputs, targets)
                 print(f"Loss: CE={loss_dict['loss_ce']:.4f}, Polyline={loss_dict['loss_polyline']:.4f}, Direction={loss_dict['loss_direction']:.4f}")
