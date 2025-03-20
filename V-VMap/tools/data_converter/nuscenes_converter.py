@@ -21,7 +21,7 @@ def parse_args():
     parser.add_argument(
         '--data-root',
         type=str,
-        default='/data/yaoyi/HDMap/Litemapnet/datasets/nuscenes',
+        default='/home/xiaoxu/work/yaoyi/HDMap/V_VMap_Test/datasets/nuscenes',
         help='specify the root path of dataset')
     parser.add_argument(
         '--newsplit',
@@ -108,12 +108,7 @@ def create_nuscenes_infos_map(root_path,
 
         # obtain 6 image's information per frame
         camera_types = [
-            'CAM_FRONT',
-            'CAM_FRONT_RIGHT',
-            'CAM_FRONT_LEFT',
-            'CAM_BACK',
-            'CAM_BACK_LEFT',
-            'CAM_BACK_RIGHT',
+            'CAM_FRONT'
         ]
         for cam in camera_types:
             cam_token = sample['data'][cam]

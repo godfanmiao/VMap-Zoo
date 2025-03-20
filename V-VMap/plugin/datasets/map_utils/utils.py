@@ -29,6 +29,13 @@ def split_collections(geom: BaseGeometry) -> List[Optional[BaseGeometry]]:
         else:
             return []
 
+def front_pol(minx, miny, maxx, maxy, ccw=True):
+    """Returns a rectangular polygon with configurable normal vector"""
+    coords = [(maxx, miny), (maxx, maxy), (minx + (maxx - minx) * 0.75, maxy), (minx, miny + (maxy - miny) // 2), (minx + (maxx - minx) * 0.75, miny)]
+    if not ccw:
+        coords = coords[::-1]
+    return Polygon(coords)
+
 def get_drivable_area_contour(drivable_areas: List[Polygon], 
                               roi_size: Tuple) -> List[LineString]:
     ''' Extract drivable area contours to get list of boundaries.
@@ -44,7 +51,7 @@ def get_drivable_area_contour(drivable_areas: List[Polygon],
     max_y = roi_size[1] / 2
 
     # a bit smaller than roi to avoid unexpected boundaries on edges
-    local_patch = box(-max_x + 0.2, -max_y + 0.2, max_x - 0.2, max_y - 0.2)
+    local_patch = front_pol(1.5, -max_y + 0.2, max_x - 0.2, max_y - 0.2)
     
     exteriors = []
     interiors = []

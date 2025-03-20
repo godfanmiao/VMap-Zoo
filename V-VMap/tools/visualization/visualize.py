@@ -8,12 +8,12 @@ from IPython import embed
 def parse_args():
     parser = argparse.ArgumentParser(
         description='Visualize groundtruth and results')
-    parser.add_argument('--config', default='/data/yaoyi/HDMap/Litemapnet/plugin/configs/litemapnet.py', help='config file path')
+    parser.add_argument('--config', default='/home/xiaoxu/work/yaoyi/HDMap/V_VMap_Test/plugin/configs/vvmap.py', help='config file path')
     parser.add_argument('--idx', type=int,
         default=0,
         help='which scene to visualize')
     parser.add_argument('--result', 
-        default='/data/yaoyi/HDMap/Litemapnet/work_dirs/litemapnet/submission_vector.json',
+        default='/home/xiaoxu/work/yaoyi/HDMap/V_VMap_Test/work_dirs/vvmap/submission_vector.json',
         help='prediction result to visualize'
         'If submission file is not provided, only gt will be visualized')
     parser.add_argument('--thr', 
@@ -75,7 +75,6 @@ def main():
     scene_dir = os.path.join(args.out_dir, scene_name)
     os.makedirs(scene_dir, exist_ok=True)
     start_idx = scene_name2idx[scene_name][0]
-    results = mmcv.load(args.result)
     for idx in mmcv.track_iter_progress(scene_name2idx[scene_name]):
         
         out_dir = os.path.join(scene_dir, str(idx - start_idx + 1))
@@ -83,6 +82,7 @@ def main():
         pred_dir = os.path.join(out_dir, 'pred')
 
         if args.result is not None:
+            results = mmcv.load(args.result)
             os.makedirs(pred_dir, exist_ok=True)
             dataset.show_result(
                     submission=results, 

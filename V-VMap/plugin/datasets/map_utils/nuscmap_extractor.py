@@ -1,6 +1,6 @@
-from shapely.geometry import LineString, box, Polygon
+from shapely.geometry import Polygon, MultiPolygon, LineString, Point, box
 from shapely import ops, strtree
-
+from shapely import affinity
 import numpy as np
 from nuscenes.map_expansion.map_api import NuScenesMap, NuScenesMapExplorer
 from nuscenes.eval.common.utils import quaternion_yaw
@@ -8,7 +8,134 @@ from pyquaternion import Quaternion
 from .utils import split_collections, get_drivable_area_contour, \
         get_ped_crossing_contour
 from numpy.typing import NDArray
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Tuple, Optional, Union
+
+
+def front_pol(minx, miny, maxx, maxy, ccw=True):
+    """Returns a rectangular polygon with configurable normal vector"""
+    coords = [(maxx, miny), (maxx, maxy), (minx + (maxx - minx) * 0.75, maxy), (minx, miny + (maxy - miny) // 2), (minx + (maxx - minx) * 0.75, miny)]
+    if not ccw:
+        coords = coords[::-1]
+    return Polygon(coords)
+
+class NuScenes_Map_Explorer(NuScenesMapExplorer):
+
+    def __init__(self, map_api: NuScenesMap, representative_layers: Tuple[str] = ('drivable_area', 'lane', 'walkway'),
+                 color_map: dict = None):
+        super().__init__(map_api, representative_layers, color_map)
+
+    def _get_layer_polygon(self,
+                           patch_box: Tuple[float, float, float, float],
+                           patch_angle: float,
+                           layer_name: str) -> List[Polygon]:
+        """
+         Retrieve the polygons of a particular layer within the specified patch.
+         :param patch_box: Patch box defined as [x_center, y_center, height, width].
+         :param patch_angle: Patch orientation in degrees.
+         :param layer_name: name of map layer to be extracted.
+         :return: List of Polygon in a patch box.
+         """
+        if layer_name not in self.map_api.non_geometric_polygon_layers:
+            raise ValueError('{} is not a polygonal layer'.format(layer_name))
+
+        patch_x = patch_box[0]
+        patch_y = patch_box[1]
+
+        patch = self.get_patch_coord(patch_box, patch_angle)
+
+        records = getattr(self.map_api, layer_name)
+
+        polygon_list = []
+        if layer_name == 'drivable_area':
+            for record in records:
+                polygons = [self.map_api.extract_polygon(polygon_token) for polygon_token in record['polygon_tokens']]
+
+                for polygon in polygons:
+                    new_polygon = polygon.intersection(patch)
+                    if not new_polygon.is_empty:
+                        new_polygon = affinity.rotate(new_polygon, -patch_angle,
+                                                      origin=(patch_x, patch_y), use_radians=False)
+                        new_polygon = affinity.affine_transform(new_polygon,
+                                                                [1.0, 0.0, 0.0, 1.0, -patch_x, -patch_y])
+                        if new_polygon.geom_type is 'Polygon':
+                            new_polygon = MultiPolygon([new_polygon])
+                        polygon_list.append(new_polygon)
+
+        else:
+            for record in records:
+                polygon = self.map_api.extract_polygon(record['polygon_token'])
+
+                if polygon.is_valid:
+                    new_polygon = polygon.intersection(patch)
+                    if not new_polygon.is_empty:
+                        new_polygon = affinity.rotate(new_polygon, -patch_angle,
+                                                      origin=(patch_x, patch_y), use_radians=False)
+                        new_polygon = affinity.affine_transform(new_polygon,
+                                                                [1.0, 0.0, 0.0, 1.0, -patch_x, -patch_y])
+                        if new_polygon.geom_type is 'Polygon':
+                            new_polygon = MultiPolygon([new_polygon])
+                        polygon_list.append(new_polygon)
+
+        return polygon_list
+
+    def _get_layer_line(self,
+                        patch_box: Tuple[float, float, float, float],
+                        patch_angle: float,
+                        layer_name: str) -> Optional[List[LineString]]:
+        """
+        Retrieve the lines of a particular layer within the specified patch.
+        :param patch_box: Patch box defined as [x_center, y_center, height, width].
+        :param patch_angle: Patch orientation in degrees.
+        :param layer_name: name of map layer to be converted to binary map mask patch.
+        :return: List of LineString in a patch box.
+        """
+        if layer_name not in self.map_api.non_geometric_line_layers:
+            raise ValueError("{} is not a line layer".format(layer_name))
+
+        if layer_name is 'traffic_light':
+            return None
+
+        patch_x = patch_box[0]
+        patch_y = patch_box[1]
+
+        patch = self.get_patch_coord(patch_box, patch_angle)
+
+        line_list = []
+        records = getattr(self.map_api, layer_name)
+        for record in records:
+            line = self.map_api.extract_line(record['line_token'])
+            if line.is_empty:  # Skip lines without nodes.
+                continue
+
+            new_line = line.intersection(patch)
+            if not new_line.is_empty:
+                new_line = affinity.rotate(new_line, -patch_angle, origin=(patch_x, patch_y), use_radians=False)
+                new_line = affinity.affine_transform(new_line,
+                                                     [1.0, 0.0, 0.0, 1.0, -patch_x, -patch_y])
+                line_list.append(new_line)
+
+        return line_list
+
+    @staticmethod
+    def get_patch_coord(patch_box: Tuple[float, float, float, float],
+                        patch_angle: float = 0.0) -> Polygon:
+        """
+        Convert patch_box to shapely Polygon coordinates.
+        :param patch_box: Patch box defined as [x_center, y_center, height, width].
+        :param patch_angle: Patch orientation in degrees.
+        :return: Box Polygon for patch_box.
+        """
+        patch_x, patch_y, patch_h, patch_w = patch_box
+
+        x_min = patch_x
+        y_min = patch_y - patch_h / 2.0
+        x_max = patch_x + patch_w / 2.0
+        y_max = patch_y + patch_h / 2.0
+
+        patch = front_pol(x_min, y_min, x_max, y_max)
+        patch = affinity.rotate(patch, patch_angle, origin=(patch_x, patch_y), use_radians=False)
+
+        return patch
 
 class NuscMapExtractor(object):
     """NuScenes map ground-truth extractor.
@@ -27,7 +154,7 @@ class NuscMapExtractor(object):
         for loc in self.MAPS:
             self.nusc_maps[loc] = NuScenesMap(
                 dataroot=data_root, map_name=loc)
-            self.map_explorer[loc] = NuScenesMapExplorer(self.nusc_maps[loc])
+            self.map_explorer[loc] = NuScenes_Map_Explorer(self.nusc_maps[loc])
         
         # local patch in nuScenes format
         self.local_patch = box(-roi_size[0] / 2, -roi_size[1] / 2, 

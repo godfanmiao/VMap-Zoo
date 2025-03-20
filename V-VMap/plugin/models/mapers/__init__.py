@@ -1,1 +1,1 @@
-from .LiteMapNet import LiteMapNet
+from .VVMap import VVMap

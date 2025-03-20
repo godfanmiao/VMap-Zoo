@@ -21,8 +21,8 @@ from IPython import embed
 def parse_args():
     parser = argparse.ArgumentParser(
         description='MMDet test (and eval) a model')
-    parser.add_argument('--config', default='/data/yaoyi/HDMap/Litemapnet/plugin/configs/litemapnet.py',help='test config file path')
-    parser.add_argument('--checkpoint', default='/data/yaoyi/HDMap/Litemapnet/work_dirs/litemapnet/latest.pth',type=str, help='checkpoint file')
+    parser.add_argument('--config', default='/data/yaoyi/HDMap/V_VMap/plugin/configs/vvmap.py',help='test config file path')
+    parser.add_argument('--checkpoint', default='/data/yaoyi/HDMap/V_VMap/work_dirs/vvmap/latest.pth',type=str, help='checkpoint file')
     parser.add_argument('--work-dir', help='the dir to save logs and models')
     parser.add_argument('--result-path', 
         help='submission file in pickle format to be evaluated')

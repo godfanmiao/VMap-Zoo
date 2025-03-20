@@ -1,6 +1,7 @@
 import copy
 import torch
 import torch.nn as nn
+import numpy as np
 from mmdet3d.models.builder import HEADS
 import torch.nn.functional as F
 from mmcv.cnn.bricks.transformer import build_positional_encoding
@@ -63,6 +64,30 @@ class Block(nn.Module):
 
         x = input + self.drop_path(x)
         return x
+        
+class adaptivemaxpool2d(nn.Module):
+
+    def __init__(self, size):
+        super().__init__()
+        self.size = np.array(size)
+
+    def forward(self, x):
+
+        in_size = np.array(x.shape[2:])
+
+        if in_size[0] % self.size[0] or in_size[1] % self.size[1]:
+            if in_size[0] % self.size[0]:
+                in_size[0] = (in_size[0] // self.size[0] + 1) * self.size[0]
+
+            if in_size[1] % self.size[1]:
+                in_size[1] = (in_size[1] // self.size[1] + 1) * self.size[1]
+
+            x = F.interpolate(x, size=tuple(in_size))
+
+        stride = np.floor(in_size / self.size).astype(np.int32)
+        kernel = in_size - (self.size - 1) * stride
+
+        return F.max_pool2d(input=x,kernel_size=list(kernel), stride = list(stride))
 
 @HEADS.register_module()
 class MapDetectorHead(nn.Module):
@@ -90,7 +115,8 @@ class MapDetectorHead(nn.Module):
             )
             self.stages.append(stage)
 
-        self.m = nn.AdaptiveMaxPool2d((10, 10))
+        #self.m = nn.AdaptiveMaxPool2d((10, 10))
+        self.m = adaptivemaxpool2d((10, 10))
 
         self.norm_out = LayerNorm(self.embed_dims, eps=1e-6)
 
@@ -114,6 +140,10 @@ class MapDetectorHead(nn.Module):
 
         self.reg_branches = reg_branches
         self.cls_branches = cls_branches
+        
+        self.tgt = nn.Embedding(self.num_queries, self.embed_dims)
+        self.qH = 10
+        self.qW = 10
 
         self._init_embedding()
         self.init_weights()
@@ -154,6 +184,12 @@ class MapDetectorHead(nn.Module):
         bev_mask = bev_features.new_zeros(B, H, W)
         bev_pos_embeddings = self.bev_pos_embed(bev_mask)  # (bs, embed_dims, H, W)
         bev_features = self.input_proj(bev_features) + bev_pos_embeddings  # (bs, embed_dims, H, W)
+        
+        tgt = self.tgt.weight.unsqueeze(1).repeat(1, B, 1)
+        tgt = tgt.permute(1, 2, 0).view(B, self.embed_dims, self.qH, self.qW)
+        tgt = F.interpolate(tgt, size=[H, W])
+
+        bev_features = bev_features + tgt
 
         assert list(bev_features.shape) == [B, self.embed_dims, H, W]
         return bev_features
